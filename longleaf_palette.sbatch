@@ -1,15 +1,13 @@
 #!/bin/bash
-#SBATCH --job-name=palette-goem
-#SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
-#SBATCH --time=24:00:00
-#SBATCH --partition=gpu           # TODO: set to the correct Longleaf GPU partition
-#SBATCH --gres=gpu:1              # Adjust GPU count/type as needed
+#SBATCH --time=23:59:59
+#SBATCH --partition=gpu            # TODO: set to the correct Longleaf GPU partition
+#SBATCH --gres=gpu:1               # Adjust GPU count/type as needed
 #SBATCH --output=/work/users/d/y/dyy12/PsyPec/logs/%x-%j.out
 #SBATCH --error=/work/users/d/y/dyy12/PsyPec/logs/%x-%j.err
-##SBATCH --account=YOUR_ALLOCATION # TODO: set if required on Longleaf
+##SBATCH --account=YOUR_ALLOCATION  # TODO: set if required on Longleaf
 ##SBATCH --mail-type=END,FAIL
 
 set -euo pipefail
@@ -18,9 +16,8 @@ WORKDIR="/work/users/d/y/dyy12/PsyPec"
 cd "$WORKDIR"
 mkdir -p "$WORKDIR/logs"
 
-# ---- Modules / environment (adjust for Longleaf) ----
-# module purge
-# module load anaconda/2023.03
+module load python/3.12.4
+# Load CUDA/toolkit module if needed for the GPU partition.
 # module load cuda/11.7
 # source activate your_env
 

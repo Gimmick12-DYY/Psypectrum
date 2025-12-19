@@ -1,14 +1,13 @@
 #!/bin/bash
+#SBATCH --job-name=PsyPec
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=48G
+#SBATCH --mem=40G
 #SBATCH --time=23:59:59
-#SBATCH --partition=gpu            # TODO: set to the correct Longleaf GPU partition
-#SBATCH --gres=gpu:1               # Adjust GPU count/type as needed
+#SBATCH --partition=a100-gpu   
+#SBATCH --gres=gpu:1
 #SBATCH --output=/work/users/d/y/dyy12/PsyPec/logs/%x-%j.out
 #SBATCH --error=/work/users/d/y/dyy12/PsyPec/logs/%x-%j.err
-##SBATCH --account=YOUR_ALLOCATION  # TODO: set if required on Longleaf
-##SBATCH --mail-type=END,FAIL
 
 set -euo pipefail
 

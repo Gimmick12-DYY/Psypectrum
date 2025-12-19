@@ -1,0 +1,45 @@
+# GoEmotions → Hue Mapping
+
+This repository uses a color palette for GoEmotions where warmer hues correspond to more positive valence and colder hues correspond to more negative valence. Hues are assigned deterministically from a heuristic valence score in \[-1, 1].
+
+Mapping formula:
+- Warm anchor (positive): `POS_HUE_DEG = 40°` (orange-ish)
+- Cold anchor (negative): `NEG_HUE_DEG = 220°` (blue-ish)
+- Given valence `v` in \[-1, 1], hue is `h = POS_HUE_DEG + (NEG_HUE_DEG - POS_HUE_DEG) * ((1 - v) / 2)`
+
+Label table (degrees):
+
+| Label          | Valence | Hue (deg) |
+| -------------- | ------- | --------- |
+| admiration     | 0.7     | 67.0      |
+| amusement      | 0.7     | 67.0      |
+| anger          | -0.8    | 202.0     |
+| annoyance      | -0.6    | 184.0     |
+| approval       | 0.6     | 76.0      |
+| caring         | 0.5     | 85.0      |
+| confusion      | -0.2    | 148.0     |
+| curiosity      | 0.2     | 112.0     |
+| desire         | 0.3     | 103.0     |
+| disappointment | -0.7    | 193.0     |
+| disapproval    | -0.6    | 184.0     |
+| disgust        | -0.8    | 202.0     |
+| embarrassment  | -0.5    | 175.0     |
+| excitement     | 0.8     | 58.0      |
+| fear           | -0.9    | 211.0     |
+| gratitude      | 0.8     | 58.0      |
+| grief          | -0.9    | 211.0     |
+| joy            | 1.0     | 40.0      |
+| love           | 1.0     | 40.0      |
+| nervousness    | -0.5    | 175.0     |
+| optimism       | 0.8     | 58.0      |
+| pride          | 0.6     | 76.0      |
+| realization    | 0.1     | 121.0     |
+| relief         | 0.5     | 85.0      |
+| remorse        | -0.7    | 193.0     |
+| sadness        | -0.8    | 202.0     |
+| surprise       | 0.0     | 130.0     |
+| neutral        | 0.0     | 130.0     |
+
+Notes:
+- The mapping is linear in valence; you can adjust `POS_HUE_DEG`, `NEG_HUE_DEG`, or per-label valence to reshape the palette.
+- We will convert these hues to unit vectors (sin, cos) in the model to avoid wrap-around discontinuities.

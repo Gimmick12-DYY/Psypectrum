@@ -60,7 +60,7 @@ GOEMOTIONS_VALENCE = {
     "neutral": 0.0,
 }
 
-# Hue anchor points (degrees): warm/orange-ish for positive, cold/blue-ish for negative.
+# Hue anchor points (degrees), standardized for coordinates: warm/orange-ish for positive, cold/blue-ish for negative.
 POS_HUE_DEG = 40.0
 NEG_HUE_DEG = 220.0
 
@@ -107,12 +107,15 @@ def hsv_to_rgb_list(h_deg: float, s: float, v: float):
 def nearest_emotion_from_hue(h_deg: torch.Tensor):
     """
     Find nearest emotion label to a hue (deg tensor scalar).
-    Returns (label, angular_distance_deg).
+    Returns (label, angular_distance_deg, confidence[0-1]).
+    Confidence is 1 at 0° difference, 0 at 180° difference (linear).
     """
     diff = torch.remainder(h_deg - GOEMOTIONS_LABEL_HUE_TENSOR + 180.0, 360.0) - 180.0
     dist = diff.abs()
     idx = dist.argmin().item()
-    return GOEMOTIONS_LABELS[idx], dist[idx].item()
+    ang = dist[idx].item()
+    conf = max(0.0, 1.0 - ang / 180.0)
+    return GOEMOTIONS_LABELS[idx], ang, conf
 
 
 def decode_seq_color(color_vec: torch.Tensor, seq_logits: torch.Tensor):
@@ -123,7 +126,7 @@ def decode_seq_color(color_vec: torch.Tensor, seq_logits: torch.Tensor):
     sat = torch.clamp(color_vec[2], 0.0, 1.0).item()
     val = torch.clamp(color_vec[3], 0.0, 1.0).item()
     rgb = hsv_to_rgb_list(hue_deg, sat, val)
-    nearest_label, hue_delta = nearest_emotion_from_hue(torch.tensor(hue_deg))
+    nearest_label, hue_delta, hue_conf = nearest_emotion_from_hue(torch.tensor(hue_deg))
 
     probs = torch.sigmoid(seq_logits)
     topk = torch.topk(probs, k=min(3, probs.numel()))
@@ -138,6 +141,7 @@ def decode_seq_color(color_vec: torch.Tensor, seq_logits: torch.Tensor):
         "rgb": rgb,
         "nearest_label": nearest_label,
         "hue_delta": hue_delta,
+        "hue_confidence": hue_conf,
         "top_seq_labels": top_labels,
     }
 
@@ -157,7 +161,7 @@ def decode_token_colors(token_colors: torch.Tensor, tokens, attention_mask=None)
         sat = torch.clamp(col[2], 0.0, 1.0).item()
         val = torch.clamp(col[3], 0.0, 1.0).item()
         rgb = hsv_to_rgb_list(float(hue.item()), sat, val)
-        label, delta = nearest_emotion_from_hue(hue)
+        label, delta, conf = nearest_emotion_from_hue(hue)
         results.append(
             {
                 "token": tok,
@@ -167,6 +171,7 @@ def decode_token_colors(token_colors: torch.Tensor, tokens, attention_mask=None)
                 "rgb": rgb,
                 "nearest_label": label,
                 "hue_delta": float(delta),
+                "hue_confidence": conf,
             }
         )
     return results
@@ -536,9 +541,12 @@ def train_goemotions_lora(
                 decoded = decode_seq_color(seq_color_cpu, seq_logits_cpu)
                 token_colors_cpu = out["token_colors"][sample_idx].detach().cpu()
                 token_hues = color_vectors_to_hues_deg(token_colors_cpu).tolist()
-                token_nearest = [
-                    nearest_emotion_from_hue(torch.tensor(h)).__getitem__(0) for h in token_hues
-                ]
+                token_nearest = []
+                token_nearest_conf = []
+                for h in token_hues:
+                    lbl, _, conf = nearest_emotion_from_hue(torch.tensor(h))
+                    token_nearest.append(lbl)
+                    token_nearest_conf.append(conf)
                 record = {
                     "split": "train",
                     "epoch": epoch,
@@ -549,9 +557,11 @@ def train_goemotions_lora(
                     "seq_rgb": decoded["rgb"],
                     "seq_nearest_label": decoded["nearest_label"],
                     "seq_hue_deg": decoded["hue_deg"],
+                    "seq_hue_confidence": decoded["hue_confidence"],
                     "token_colors": out["token_colors"][sample_idx].detach().cpu().tolist(),
                     "token_hues": token_hues,
                     "token_nearest_labels": token_nearest,
+                    "token_nearest_conf": token_nearest_conf,
                     "seq_logits": out["seq_logits"][sample_idx].detach().cpu().tolist(),
                     "token_probs": out["token_probs"][sample_idx].detach().cpu().tolist(),
                     "top_seq_labels": decoded["top_seq_labels"],
@@ -586,9 +596,12 @@ def train_goemotions_lora(
                     decoded = decode_seq_color(seq_color_cpu, seq_logits_cpu)
                     token_colors_cpu = out["token_colors"][sample_idx].detach().cpu()
                     token_hues = color_vectors_to_hues_deg(token_colors_cpu).tolist()
-                    token_nearest = [
-                        nearest_emotion_from_hue(torch.tensor(h)).__getitem__(0) for h in token_hues
-                    ]
+                    token_nearest = []
+                    token_nearest_conf = []
+                    for h in token_hues:
+                        lbl, _, conf = nearest_emotion_from_hue(torch.tensor(h))
+                        token_nearest.append(lbl)
+                        token_nearest_conf.append(conf)
                     record = {
                         "split": "val",
                         "epoch": epoch,
@@ -599,9 +612,11 @@ def train_goemotions_lora(
                         "seq_rgb": decoded["rgb"],
                         "seq_nearest_label": decoded["nearest_label"],
                         "seq_hue_deg": decoded["hue_deg"],
+                        "seq_hue_confidence": decoded["hue_confidence"],
                         "token_colors": out["token_colors"][sample_idx].detach().cpu().tolist(),
                         "token_hues": token_hues,
                         "token_nearest_labels": token_nearest,
+                        "token_nearest_conf": token_nearest_conf,
                         "seq_logits": out["seq_logits"][sample_idx].detach().cpu().tolist(),
                         "token_probs": out["token_probs"][sample_idx].detach().cpu().tolist(),
                         "top_seq_labels": decoded["top_seq_labels"],

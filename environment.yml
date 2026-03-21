@@ -1,0 +1,23 @@
+# Conda environment for Psypectrum (BERT + GoEmotions + Hugging Face).
+#
+# Create and activate:
+#   conda env create -f environment.yml
+#   conda activate psypectrum
+#
+# GPU (CUDA): after the env exists, install a CUDA build of PyTorch that matches
+# your cluster driver/CUDA module, e.g. (adjust cu121/cu124 as needed):
+#   conda activate psypectrum
+#   pip install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+#
+# CPU-only: the pip torch line below is enough for local CPU runs.
+
+name: psypectrum
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+    - torch>=2.0
+    - transformers>=4.30
+    - datasets>=2.14

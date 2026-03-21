@@ -1,400 +1,142 @@
-import colorsys
+"""
+Emotion–color augmented GNN–BERT for GoEmotions (production_plan.md).
+
+Phase A: bert-base-uncased produces pooled embeddings and per-label logits.
+Phase B: deterministic 3D emotion vectors from COLOR_MAP + sigmoid weights,
+         projected 3 -> 128 with GELU, LayerNorm on 768 + 128.
+Phase C: batch graph from cosine similarity on CLS embeddings, 2-layer GCN,
+         classifier + optional residual from frozen BERT head.
+"""
+
+from __future__ import annotations
+
 import json
+import os
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from transformers import AutoModel, AutoTokenizer
 
 
-# =====================================================
-# 0. GoEmotions label config (28 labels)
-# =====================================================
+# ---------------------------------------------------------------------------
+# 0. GoEmotions label order (28 labels)
+# ---------------------------------------------------------------------------
 
-GOEMOTIONS_LABELS = [
-    "admiration", "amusement", "anger", "annoyance", "approval",
-    "caring", "confusion", "curiosity", "desire", "disappointment",
-    "disapproval", "disgust", "embarrassment", "excitement", "fear",
-    "gratitude", "grief", "joy", "love", "nervousness",
-    "optimism", "pride", "realization", "relief", "remorse",
-    "sadness", "surprise", "neutral",
+GOEMOTIONS_LABELS: List[str] = [
+    "admiration",
+    "amusement",
+    "anger",
+    "annoyance",
+    "approval",
+    "caring",
+    "confusion",
+    "curiosity",
+    "desire",
+    "disappointment",
+    "disapproval",
+    "disgust",
+    "embarrassment",
+    "excitement",
+    "fear",
+    "gratitude",
+    "grief",
+    "joy",
+    "love",
+    "nervousness",
+    "optimism",
+    "pride",
+    "realization",
+    "relief",
+    "remorse",
+    "sadness",
+    "surprise",
+    "neutral",
 ]
 
 NUM_LABELS = len(GOEMOTIONS_LABELS)
+LABEL_TO_INDEX = {name: i for i, name in enumerate(GOEMOTIONS_LABELS)}
 
 
-# =====================================================
-# 0b. GoEmotions -> hue mapping (warm = positive, cold = negative)
-# =====================================================
+# ---------------------------------------------------------------------------
+# 1. Parse COLOR_MAP.txt -> valence, hue (deg), saturation rules
+# ---------------------------------------------------------------------------
 
-# Heuristic valence scores in [-1, 1]; tweak as desired.
-GOEMOTIONS_VALENCE = {
-    "admiration": 0.7,
-    "amusement": 0.7,
-    "anger": -0.8,
-    "annoyance": -0.6,
-    "approval": 0.6,
-    "caring": 0.5,
-    "confusion": -0.2,
-    "curiosity": 0.2,
-    "desire": 0.3,
-    "disappointment": -0.7,
-    "disapproval": -0.6,
-    "disgust": -0.8,
-    "embarrassment": -0.5,
-    "excitement": 0.8,
-    "fear": -0.9,
-    "gratitude": 0.8,
-    "grief": -0.9,
-    "joy": 1.0,
-    "love": 1.0,
-    "nervousness": -0.5,
-    "optimism": 0.8,
-    "pride": 0.6,
-    "realization": 0.1,
-    "relief": 0.5,
-    "remorse": -0.7,
-    "sadness": -0.8,
-    "surprise": 0.0,
-    "neutral": 0.0,
-}
-
-# Hue anchor points (degrees), standardized for coordinates: warm/orange-ish for positive, cold/blue-ish for negative.
-POS_HUE_DEG = 40.0
-NEG_HUE_DEG = 220.0
-
-
-def _valence_to_hue_deg(valence: float) -> float:
-    """
-    Map valence [-1,1] to a hue on a cold<->warm line.
-    valence=1 -> POS_HUE_DEG, valence=-1 -> NEG_HUE_DEG.
-    """
-    v = max(-1.0, min(1.0, valence))
-    t = (1.0 - v) / 2.0  # 0 for warmest, 1 for coldest
-    return POS_HUE_DEG + (NEG_HUE_DEG - POS_HUE_DEG) * t
-
-
-GOEMOTIONS_LABEL_TO_HUE_DEG = {
-    label: _valence_to_hue_deg(GOEMOTIONS_VALENCE[label]) for label in GOEMOTIONS_LABELS
-}
-GOEMOTIONS_LABEL_HUE_TENSOR = torch.tensor(
-    [GOEMOTIONS_LABEL_TO_HUE_DEG[l] for l in GOEMOTIONS_LABELS],
-    dtype=torch.float,
+_ROW_RE = re.compile(
+    r"^\|\s*([a-z_]+)\s*\|\s*([-0-9.]+)\s*\|\s*([-0-9.]+)\s*\|\s*$",
+    re.IGNORECASE,
 )
 
 
-def color_vectors_to_hues_deg(color_vectors: torch.Tensor) -> torch.Tensor:
+def load_color_map(path: str) -> Dict[str, Dict[str, float]]:
     """
-    Convert color vectors [*, 4] (sin h, cos h, sat, val) to hue degrees in [0, 360).
+    Parse the markdown table in COLOR_MAP.txt into label -> {valence, hue_deg}.
+    Saturation is not stored in the table: neutral -> 0, all other labels -> 1.0.
     """
-    sin_h = color_vectors[..., 0]
-    cos_h = color_vectors[..., 1]
-    hue_rad = torch.atan2(sin_h, cos_h)
-    hue_deg = torch.remainder(torch.rad2deg(hue_rad) + 360.0, 360.0)
-    return hue_deg
+    out: Dict[str, Dict[str, float]] = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            m = _ROW_RE.match(line)
+            if not m:
+                continue
+            label = m.group(1).lower()
+            valence = float(m.group(2))
+            hue_deg = float(m.group(3))
+            out[label] = {"valence": valence, "hue_deg": hue_deg}
+
+    missing = [l for l in GOEMOTIONS_LABELS if l not in out]
+    if missing:
+        raise ValueError(f"COLOR_MAP missing labels: {missing}")
+    return out
 
 
-def hsv_to_rgb_list(h_deg: float, s: float, v: float):
+def _label_color_table(color_map: Dict[str, Dict[str, float]]) -> torch.Tensor:
     """
-    Convert HSV (degrees, 0-1, 0-1) to RGB list in [0,1] using colorsys.
+    Per-label 3D vectors [sat*cos(h), sat*sin(h), valence] with hue in radians.
+    Neutral: saturation 0 (origin in hue plane). Others: saturation 1.0.
+    Surprise vs neutral at same hue: valence/saturation distinguish (neutral sat=0).
     """
-    h_norm = (h_deg % 360.0) / 360.0
-    r, g, b = colorsys.hsv_to_rgb(h_norm, float(s), float(v))
-    return [r, g, b]
+    rows = []
+    for label in GOEMOTIONS_LABELS:
+        v = color_map[label]["valence"]
+        h_deg = color_map[label]["hue_deg"]
+        sat = 0.0 if label == "neutral" else 1.0
+        h_rad = torch.deg2rad(torch.tensor(h_deg, dtype=torch.float32))
+        cos_h = torch.cos(h_rad)
+        sin_h = torch.sin(h_rad)
+        x = sat * cos_h
+        y = sat * sin_h
+        rows.append(torch.stack([x, y, torch.tensor(v, dtype=torch.float32)]))
+    return torch.stack(rows, dim=0)  # [28, 3]
 
 
-def nearest_emotion_from_hue(h_deg: torch.Tensor):
-    """
-    Find nearest emotion label to a hue (deg tensor scalar).
-    Returns (label, angular_distance_deg, confidence[0-1]).
-    Confidence is 1 at 0° difference, 0 at 180° difference (linear).
-    """
-    diff = torch.remainder(h_deg - GOEMOTIONS_LABEL_HUE_TENSOR + 180.0, 360.0) - 180.0
-    dist = diff.abs()
-    idx = dist.argmin().item()
-    ang = dist[idx].item()
-    conf = max(0.0, 1.0 - ang / 180.0)
-    return GOEMOTIONS_LABELS[idx], ang, conf
+def default_color_map_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "COLOR_MAP.txt")
 
 
-def decode_seq_color(color_vec: torch.Tensor, seq_logits: torch.Tensor):
-    """
-    Decode a single sequence color vector and logits into readable values.
-    """
-    hue_deg = color_vectors_to_hues_deg(color_vec)[...].item()
-    sat = torch.clamp(color_vec[2], 0.0, 1.0).item()
-    val = torch.clamp(color_vec[3], 0.0, 1.0).item()
-    rgb = hsv_to_rgb_list(hue_deg, sat, val)
-    nearest_label, hue_delta, hue_conf = nearest_emotion_from_hue(torch.tensor(hue_deg))
+# ---------------------------------------------------------------------------
+# 2. Dataset
+# ---------------------------------------------------------------------------
 
-    probs = torch.sigmoid(seq_logits)
-    topk = torch.topk(probs, k=min(3, probs.numel()))
-    top_labels = [
-        (GOEMOTIONS_LABELS[i], probs[i].item()) for i in topk.indices.tolist()
-    ]
-
-    return {
-        "hue_deg": hue_deg,
-        "sat": sat,
-        "val": val,
-        "rgb": rgb,
-        "nearest_label": nearest_label,
-        "hue_delta": hue_delta,
-        "hue_confidence": hue_conf,
-        "top_seq_labels": top_labels,
-    }
-
-
-def decode_token_colors(token_colors: torch.Tensor, tokens, attention_mask=None):
-    """
-    Decode per-token color vectors into hue/RGB and nearest label.
-    token_colors: [L, 4] tensor.
-    tokens: list of token strings (same length L).
-    attention_mask: optional [L] mask to skip paddings.
-    """
-    hues = color_vectors_to_hues_deg(token_colors)
-    results = []
-    for i, (tok, hue, col) in enumerate(zip(tokens, hues, token_colors)):
-        if attention_mask is not None and attention_mask[i].item() == 0:
-            continue
-        sat = torch.clamp(col[2], 0.0, 1.0).item()
-        val = torch.clamp(col[3], 0.0, 1.0).item()
-        rgb = hsv_to_rgb_list(float(hue.item()), sat, val)
-        label, delta, conf = nearest_emotion_from_hue(hue)
-        results.append(
-            {
-                "token": tok,
-                "hue_deg": float(hue.item()),
-                "sat": sat,
-                "val": val,
-                "rgb": rgb,
-                "nearest_label": label,
-                "hue_delta": float(delta),
-                "hue_confidence": conf,
-            }
-        )
-    return results
-
-
-def run_palette_inference(text: str, model, tokenizer, device):
-    """
-    Convenience inference: returns decoded sequence and token-level palette info.
-    """
-    model.eval()
-    enc = tokenizer(
-        text,
-        truncation=True,
-        padding="max_length",
-        max_length=128,
-        return_tensors="pt",
-    )
-    input_ids = enc["input_ids"].to(device)
-    attention_mask = enc["attention_mask"].to(device)
-
-    with torch.no_grad():
-        out = model(input_ids=input_ids, attention_mask=attention_mask)
-
-    seq_decoded = decode_seq_color(
-        out["seq_color"][0].cpu(), out["seq_logits"][0].cpu()
-    )
-    tokens = tokenizer.convert_ids_to_tokens(input_ids[0])
-    token_decoded = decode_token_colors(
-        out["token_colors"][0].cpu(), tokens, attention_mask=attention_mask[0]
-    )
-
-    return {
-        "text": text,
-        "seq_color": seq_decoded,
-        "tokens": token_decoded,
-    }
-
-
-# =====================================================
-# 1. Gated Attention Pooling
-# =====================================================
-
-class GatedAttentionPooling(nn.Module):
-    """
-    H: [B, L, hidden]
-    attention_mask: [B, L] (1 = real token, 0 = padding)
-    """
-
-    def __init__(self, hidden_size: int, attn_size: int = 256):
-        super().__init__()
-        self.W_att = nn.Linear(hidden_size, attn_size)
-        self.v_att = nn.Linear(attn_size, 1, bias=False)
-        self.W_gate = nn.Linear(hidden_size, 1)
-
-    def forward(self, H, attention_mask):
-        U = torch.tanh(self.W_att(H))            # [B, L, attn_size]
-        raw_scores = self.v_att(U).squeeze(-1)   # [B, L]
-
-        gates = torch.sigmoid(self.W_gate(H)).squeeze(-1)  # [B, L]
-        gated_scores = raw_scores * gates                  # [B, L]
-
-        mask = attention_mask == 0
-        gated_scores = gated_scores.masked_fill(mask, -1e9)
-
-        attn_weights = torch.softmax(gated_scores, dim=-1)  # [B, L]
-        z = torch.bmm(attn_weights.unsqueeze(1), H).squeeze(1)  # [B, hidden]
-
-        return z, attn_weights, gates
-
-
-# =====================================================
-# 2. LoRA-wrapped LLaMA + gated attention head
-# =====================================================
-
-class LLaMAGoEmotionsPEFT(nn.Module):
-    """
-    LLaMA backbone (LoRA enabled) + gated attention pooling + 28-dim GoEmotions head
-    """
-
-    def __init__(
-        self,
-        llama_model,         # LoRA wrapped backbone
-        hidden_size: int,
-        num_labels: int = NUM_LABELS,
-        attn_size: int = 256,
-        color_loss_weight: float = 0.0,
-    ):
-        super().__init__()
-
-        self.llm = llama_model
-        self.gated_pool = GatedAttentionPooling(hidden_size, attn_size)
-
-        self.seq_head = nn.Linear(hidden_size, num_labels)
-        self.token_head = nn.Linear(hidden_size, num_labels)
-
-        self.loss_seq = nn.BCEWithLogitsLoss()
-        self.loss_tok = nn.BCEWithLogitsLoss(reduction="none")
-
-        self.num_labels = num_labels
-        self.color_loss_weight = color_loss_weight
-
-        # Precompute label hue unit vectors (sin, cos) for mixing hues.
-        hues_deg = torch.tensor(
-            [GOEMOTIONS_LABEL_TO_HUE_DEG[l] for l in GOEMOTIONS_LABELS],
-            dtype=torch.float,
-        )
-        hues_rad = torch.deg2rad(hues_deg)
-        label_hue_unit = torch.stack([torch.sin(hues_rad), torch.cos(hues_rad)], dim=-1)
-        self.register_buffer("label_hue_unit", label_hue_unit)  # [num_labels, 2]
-
-    def forward(
-        self,
-        input_ids,
-        attention_mask,
-        seq_targets=None,
-        token_targets=None,
-    ):
-        outputs = self.llm(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-            output_hidden_states=False,
-            return_dict=True,
-        )
-        H = outputs.last_hidden_state  # [B, L, hidden]
-
-        token_logits = self.token_head(H)
-        z, attn, gates = self.gated_pool(H, attention_mask)
-        seq_logits = self.seq_head(z)
-
-        # --- Color projection ---
-        # Token-level probabilities over emotions.
-        token_probs = torch.sigmoid(token_logits)  # [B, L, num_labels]
-
-        # Normalize for hue mixing to keep angles on the unit circle.
-        prob_mass = token_probs.sum(dim=-1, keepdim=True) + 1e-8  # [B, L, 1]
-        mixed_unit = torch.matmul(
-            token_probs / prob_mass, self.label_hue_unit
-        )  # [B, L, 2] (sin, cos)
-
-        # Saturation/value as simple intensity summaries.
-        sat = token_probs.mean(dim=-1)          # [B, L]
-        val = token_probs.max(dim=-1).values    # [B, L]
-
-        token_colors = torch.stack(
-            [mixed_unit[..., 0], mixed_unit[..., 1], sat, val], dim=-1
-        )  # [B, L, 4] -> (sin h, cos h, sat, val)
-
-        # Fuse colors with gated attention weights.
-        fused_color = torch.bmm(attn.unsqueeze(1), token_colors).squeeze(1)  # [B, 4]
-
-        loss = None
-        if seq_targets is not None or token_targets is not None:
-            losses = []
-
-            if seq_targets is not None:
-                seq_loss = self.loss_seq(seq_logits, seq_targets)
-                losses.append(seq_loss)
-
-            if token_targets is not None:
-                raw_tok_loss = self.loss_tok(token_logits, token_targets)
-                mask = attention_mask.unsqueeze(-1).float()
-                tok_loss_masked = raw_tok_loss * mask
-                denom = mask.sum() * self.num_labels + 1e-8
-                tok_loss = tok_loss_masked.sum() / denom
-                losses.append(tok_loss)
-
-            loss = sum(losses)
-
-        # Optional color-space alignment loss: align fused hue to label hue.
-        if self.color_loss_weight > 0 and seq_targets is not None:
-            target_mass = seq_targets.sum(dim=-1, keepdim=True) + 1e-8  # [B, 1]
-            target_unit = torch.matmul(
-                seq_targets / target_mass, self.label_hue_unit
-            )  # [B, 2]
-
-            fused_unit = fused_color[:, :2]  # [B, 2]
-
-            # Cosine similarity on unit vectors; safeguard norms.
-            denom = (
-                fused_unit.norm(dim=-1) * target_unit.norm(dim=-1) + 1e-8
-            )  # [B]
-            cos_sim = (fused_unit * target_unit).sum(dim=-1) / denom
-            color_loss = (1.0 - cos_sim).mean()
-
-            if loss is None:
-                loss = self.color_loss_weight * color_loss
-            else:
-                loss = loss + self.color_loss_weight * color_loss
-
-        return {
-            "loss": loss,
-            "seq_logits": seq_logits,
-            "token_colors": token_colors,
-            "seq_color": fused_color,
-            "attn_weights": attn,
-            "token_probs": token_probs,
-        }
-
-
-# =====================================================
-# 3. Dataset wrapper for SetFit/go_emotions
-# =====================================================
 
 class GoEmotionsDataset(Dataset):
-    """
-    Converts the HF dataset rows into:
-        input_ids, attention_mask, label vector
-    """
-
-    def __init__(self, split, tokenizer, max_length=128):
+    def __init__(self, split, tokenizer, max_length: int = 128):
         self.data = split
         self.tokenizer = tokenizer
         self.max_length = max_length
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.data)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         row = self.data[idx]
         text = row["text"]
         labels = [float(row[label]) for label in GOEMOTIONS_LABELS]
-
         enc = self.tokenizer(
             text,
             truncation=True,
@@ -402,7 +144,6 @@ class GoEmotionsDataset(Dataset):
             max_length=self.max_length,
             return_tensors="pt",
         )
-
         return {
             "input_ids": enc["input_ids"].squeeze(0),
             "attention_mask": enc["attention_mask"].squeeze(0),
@@ -410,99 +151,350 @@ class GoEmotionsDataset(Dataset):
         }
 
 
-def goemotions_collate_fn(batch):
-    ids = torch.stack([b["input_ids"] for b in batch])
-    mask = torch.stack([b["attention_mask"] for b in batch])
-    labels = torch.stack([b["labels"] for b in batch])
-    return {"input_ids": ids, "attention_mask": mask, "labels": labels}
+def goemotions_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    return {
+        "input_ids": torch.stack([b["input_ids"] for b in batch]),
+        "attention_mask": torch.stack([b["attention_mask"] for b in batch]),
+        "labels": torch.stack([b["labels"] for b in batch]),
+    }
 
 
-# =====================================================
-# 4. Build LoRA model
-# =====================================================
-
-def build_lora_llama(
-    base_model_name: str,
-    r: int = 8,
-    alpha: int = 16,
-    dropout: float = 0.05,
-):
-    backbone = AutoModelForCausalLM.from_pretrained(
-        base_model_name,
-        trust_remote_code=True,
-    )
-
-    backbone = prepare_model_for_kbit_training(backbone)
-
-    config = LoraConfig(
-        r=r,
-        lora_alpha=alpha,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        lora_dropout=dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-
-    peft_model = get_peft_model(backbone, config)
-    hidden_size = peft_model.config.hidden_size
-
-    return peft_model, hidden_size
+# ---------------------------------------------------------------------------
+# 3. Models
+# ---------------------------------------------------------------------------
 
 
-# =====================================================
-# 5. Training function (for SLURM call)
-# =====================================================
+class BERTOnlyBaseline(nn.Module):
+    """BERT pooled -> linear head. For baseline comparison."""
 
-def train_goemotions_lora(
-    base_model_name: str,
-    batch_size: int,
-    lr: float,
-    max_length: int,
-    epochs: int,
-    device: torch.device,
-    color_loss_weight: float = 0.1,
-    log_jsonl_path: str = None,
+    def __init__(self, bert_name: str = "bert-base-uncased", num_labels: int = NUM_LABELS):
+        super().__init__()
+        self.bert = AutoModel.from_pretrained(bert_name)
+        hidden = self.bert.config.hidden_size
+        self.classifier = nn.Linear(hidden, num_labels)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        pooled = out.last_hidden_state[:, 0]
+        logits = self.classifier(pooled)
+        return {"logits": logits, "pooled": pooled}
+
+
+class EmotionColorGNNBERT(nn.Module):
+    """
+    BERT -> (frozen in joint phase) logits for color weights;
+    weighted 3D emotion vectors -> Linear 3x128 + GELU + LayerNorm;
+    LayerNorm on CLS; concat -> GCN (batch graph) -> classifier;
+    optional residual from frozen BERT logits.
+    """
+
+    def __init__(
+        self,
+        bert_name: str = "bert-base-uncased",
+        color_map_path: Optional[str] = None,
+        gcn_hidden: int = 896,
+        num_labels: int = NUM_LABELS,
+        adj_temperature: float = 1.0,
+        use_residual: bool = True,
+    ):
+        super().__init__()
+        self.bert = AutoModel.from_pretrained(bert_name)
+        hidden = self.bert.config.hidden_size
+        self.bert_head = nn.Linear(hidden, num_labels)
+
+        cmap = load_color_map(color_map_path or default_color_map_path())
+        table = _label_color_table(cmap)
+        self.register_buffer("label_color_vectors", table)
+
+        self.ln_bert = nn.LayerNorm(hidden)
+        self.color_proj = nn.Sequential(
+            nn.Linear(3, 128),
+            nn.GELU(),
+        )
+        self.ln_color = nn.LayerNorm(128)
+
+        concat_dim = hidden + 128
+        self.gcn1 = nn.Linear(concat_dim, gcn_hidden)
+        self.gcn2 = nn.Linear(gcn_hidden, gcn_hidden)
+        self.gnn_classifier = nn.Linear(gcn_hidden, num_labels)
+
+        self.adj_temperature = adj_temperature
+        self.use_residual = use_residual
+        self.residual_scale = nn.Parameter(torch.tensor(1.0))
+
+        self._loss = nn.BCEWithLogitsLoss()
+
+    def _batch_adjacency(self, pooled: torch.Tensor) -> torch.Tensor:
+        """Row-normalized softmax similarity + self-loop (B, B)."""
+        z = F.normalize(pooled, p=2, dim=-1)
+        sim = torch.matmul(z, z.transpose(0, 1)) / self.adj_temperature
+        adj = F.softmax(sim, dim=-1)
+        b = adj.size(0)
+        eye = torch.eye(b, device=adj.device, dtype=adj.dtype)
+        adj = adj + eye
+        adj = adj / (adj.sum(dim=-1, keepdim=True) + 1e-8)
+        return adj
+
+    def _emotion_vectors(self, logits_bert: torch.Tensor) -> torch.Tensor:
+        probs = torch.sigmoid(logits_bert)
+        mass = probs.sum(dim=-1, keepdim=True) + 1e-8
+        w = probs / mass
+        e = torch.matmul(w, self.label_color_vectors)
+        return e
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+        bert_only: bool = False,
+    ) -> Dict[str, Any]:
+        out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        pooled = out.last_hidden_state[:, 0]
+        logits_bert = self.bert_head(pooled)
+
+        if bert_only:
+            loss = None
+            if labels is not None:
+                loss = self._loss(logits_bert, labels)
+            return {
+                "loss": loss,
+                "logits": logits_bert,
+                "pooled": pooled,
+            }
+
+        e_vec = self._emotion_vectors(logits_bert)
+        c = self.color_proj(e_vec)
+        x_b = self.ln_bert(pooled)
+        x_c = self.ln_color(c)
+        x = torch.cat([x_b, x_c], dim=-1)
+
+        adj = self._batch_adjacency(pooled.detach())
+        h = torch.matmul(adj, x)
+        h = F.gelu(self.gcn1(h))
+        h = torch.matmul(adj, h)
+        h = F.gelu(self.gcn2(h))
+        logits_gnn = self.gnn_classifier(h)
+
+        if self.use_residual:
+            logits = logits_gnn + self.residual_scale * logits_bert
+        else:
+            logits = logits_gnn
+
+        loss = None
+        if labels is not None:
+            loss = self._loss(logits, labels)
+
+        return {
+            "loss": loss,
+            "logits": logits,
+            "logits_bert": logits_bert,
+            "logits_gnn": logits_gnn,
+            "pooled": pooled,
+            "emotion_vectors": e_vec,
+        }
+
+    def set_bert_trainable(self, trainable: bool) -> None:
+        for p in self.bert.parameters():
+            p.requires_grad = trainable
+        for p in self.bert_head.parameters():
+            p.requires_grad = trainable
+
+
+def freeze_gnn_for_warmup(model: EmotionColorGNNBERT) -> None:
+    """Train only BERT + bert_head; hold color/GNN parameters fixed."""
+    model.set_bert_trainable(True)
+    for p in model.color_proj.parameters():
+        p.requires_grad = False
+    for p in model.ln_bert.parameters():
+        p.requires_grad = False
+    for p in model.ln_color.parameters():
+        p.requires_grad = False
+    for p in model.gcn1.parameters():
+        p.requires_grad = False
+    for p in model.gcn2.parameters():
+        p.requires_grad = False
+    for p in model.gnn_classifier.parameters():
+        p.requires_grad = False
+    model.residual_scale.requires_grad = False
+
+
+def freeze_for_joint(model: EmotionColorGNNBERT) -> None:
+    """Freeze BERT + BERT head; train color projection, norms, GCN, classifier."""
+    model.set_bert_trainable(False)
+    for p in model.color_proj.parameters():
+        p.requires_grad = True
+    for p in model.ln_bert.parameters():
+        p.requires_grad = True
+    for p in model.ln_color.parameters():
+        p.requires_grad = True
+    for p in model.gcn1.parameters():
+        p.requires_grad = True
+    for p in model.gcn2.parameters():
+        p.requires_grad = True
+    for p in model.gnn_classifier.parameters():
+        p.requires_grad = True
+    model.residual_scale.requires_grad = True
+
+
+def unfreeze_bert(model: EmotionColorGNNBERT) -> None:
+    model.set_bert_trainable(True)
+
+
+# ---------------------------------------------------------------------------
+# 4. Metrics (multi-label)
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def multilabel_f1(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    threshold: float = 0.5,
+) -> Dict[str, float]:
+    probs = torch.sigmoid(logits)
+    pred = (probs >= threshold).float()
+    tp = (pred * labels).sum()
+    fp = (pred * (1 - labels)).sum()
+    fn = ((1 - pred) * labels).sum()
+    micro_p = tp / (tp + fp + 1e-8)
+    micro_r = tp / (tp + fn + 1e-8)
+    micro_f1 = 2 * micro_p * micro_r / (micro_p + micro_r + 1e-8)
+    return {
+        "micro_precision": float(micro_p.item()),
+        "micro_recall": float(micro_r.item()),
+        "micro_f1": float(micro_f1.item()),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 5. Training loops
+# ---------------------------------------------------------------------------
+
+
+def train_goemotions_warmup(
+    bert_name: str = "bert-base-uncased",
+    batch_size: int = 16,
+    lr: float = 2e-5,
+    max_length: int = 128,
+    epochs: int = 3,
+    device: Optional[torch.device] = None,
+    color_map_path: Optional[str] = None,
+    log_jsonl_path: Optional[str] = None,
     log_every: int = 200,
-):
-
+) -> EmotionColorGNNBERT:
+    """Train BERT + bert_head only (GNN path skipped via bert_only=True)."""
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ds = load_dataset("SetFit/go_emotions")
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        base_model_name,
-        trust_remote_code=True,
-        use_fast=False,
-        padding_side="left",
-    )
-
-    train_set = GoEmotionsDataset(ds["train"], tokenizer, max_length)
-    val_set = GoEmotionsDataset(ds["validation"], tokenizer, max_length)
-
+    tokenizer = AutoTokenizer.from_pretrained(bert_name)
     train_loader = DataLoader(
-        train_set,
+        GoEmotionsDataset(ds["train"], tokenizer, max_length),
         batch_size=batch_size,
         shuffle=True,
         num_workers=2,
         collate_fn=goemotions_collate_fn,
     )
-
     val_loader = DataLoader(
-        val_set,
+        GoEmotionsDataset(ds["validation"], tokenizer, max_length),
         batch_size=batch_size,
         shuffle=False,
         num_workers=2,
         collate_fn=goemotions_collate_fn,
     )
 
-    peft_llama, hidden_size = build_lora_llama(base_model_name)
-    peft_llama.to(device)
-
-    model = LLaMAGoEmotionsPEFT(
-        llama_model=peft_llama,
-        hidden_size=hidden_size,
-        num_labels=NUM_LABELS,
-        attn_size=256,
-        color_loss_weight=color_loss_weight,
+    model = EmotionColorGNNBERT(
+        bert_name=bert_name,
+        color_map_path=color_map_path,
     ).to(device)
+    freeze_gnn_for_warmup(model)
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=lr,
+    )
+
+    for epoch in range(epochs):
+        model.train()
+        for step, batch in enumerate(train_loader):
+            ids = batch["input_ids"].to(device)
+            mask = batch["attention_mask"].to(device)
+            y = batch["labels"].to(device)
+            out = model(ids, mask, labels=y, bert_only=True)
+            loss = out["loss"]
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            if log_jsonl_path and step % log_every == 0:
+                _log_step(
+                    log_jsonl_path,
+                    "warmup_train",
+                    epoch,
+                    step,
+                    tokenizer,
+                    ids,
+                    out,
+                )
+
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for step, batch in enumerate(val_loader):
+                ids = batch["input_ids"].to(device)
+                mask = batch["attention_mask"].to(device)
+                y = batch["labels"].to(device)
+                out = model(ids, mask, labels=y, bert_only=True)
+                val_loss += out["loss"].item() * ids.size(0)
+                if log_jsonl_path and step % log_every == 0:
+                    _log_step(
+                        log_jsonl_path,
+                        "warmup_val",
+                        epoch,
+                        step,
+                        tokenizer,
+                        ids,
+                        out,
+                    )
+        val_loss /= len(val_loader.dataset)
+        print(f"[Warmup epoch {epoch + 1}] val loss = {val_loss:.4f}")
+
+    return model
+
+
+def train_goemotions_joint(
+    model: EmotionColorGNNBERT,
+    bert_name: str = "bert-base-uncased",
+    batch_size: int = 16,
+    lr: float = 1e-3,
+    max_length: int = 128,
+    epochs: int = 3,
+    device: Optional[torch.device] = None,
+    log_jsonl_path: Optional[str] = None,
+    log_every: int = 200,
+) -> EmotionColorGNNBERT:
+    """Joint: BERT frozen; train color projection + GNN + classifier."""
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    freeze_for_joint(model)
+
+    ds = load_dataset("SetFit/go_emotions")
+    tokenizer = AutoTokenizer.from_pretrained(bert_name)
+    train_loader = DataLoader(
+        GoEmotionsDataset(ds["train"], tokenizer, max_length),
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=2,
+        collate_fn=goemotions_collate_fn,
+    )
+    val_loader = DataLoader(
+        GoEmotionsDataset(ds["validation"], tokenizer, max_length),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=2,
+        collate_fn=goemotions_collate_fn,
+    )
 
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
@@ -510,121 +502,258 @@ def train_goemotions_lora(
     )
 
     for epoch in range(epochs):
-
-        # ---- TRAIN ----
         model.train()
         for step, batch in enumerate(train_loader):
             ids = batch["input_ids"].to(device)
             mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
-
-            out = model(
-                input_ids=ids,
-                attention_mask=mask,
-                seq_targets=labels,
-                token_targets=None,
-            )
-
+            y = batch["labels"].to(device)
+            out = model(ids, mask, labels=y, bert_only=False)
             loss = out["loss"]
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            # Optional logging for research/inspection.
-            if log_jsonl_path and (step % log_every == 0):
-                sample_idx = 0
-                text = tokenizer.decode(
-                    ids[sample_idx].tolist(), skip_special_tokens=True
+            if log_jsonl_path and step % log_every == 0:
+                _log_step_joint(
+                    log_jsonl_path,
+                    "joint_train",
+                    epoch,
+                    step,
+                    tokenizer,
+                    ids,
+                    out,
                 )
-                seq_color_cpu = out["seq_color"][sample_idx].detach().cpu()
-                seq_logits_cpu = out["seq_logits"][sample_idx].detach().cpu()
-                decoded = decode_seq_color(seq_color_cpu, seq_logits_cpu)
-                token_colors_cpu = out["token_colors"][sample_idx].detach().cpu()
-                token_hues = color_vectors_to_hues_deg(token_colors_cpu).tolist()
-                token_nearest = []
-                token_nearest_conf = []
-                for h in token_hues:
-                    lbl, _, conf = nearest_emotion_from_hue(torch.tensor(h))
-                    token_nearest.append(lbl)
-                    token_nearest_conf.append(conf)
-                record = {
-                    "split": "train",
-                    "epoch": epoch,
-                    "step": step,
-                    "text": text,
-                    "seq_color": out["seq_color"][sample_idx].detach().cpu().tolist(),
-                    "seq_color_decoded": decoded,
-                    "seq_rgb": decoded["rgb"],
-                    "seq_nearest_label": decoded["nearest_label"],
-                    "seq_hue_deg": decoded["hue_deg"],
-                    "seq_hue_confidence": decoded["hue_confidence"],
-                    "token_colors": out["token_colors"][sample_idx].detach().cpu().tolist(),
-                    "token_hues": token_hues,
-                    "token_nearest_labels": token_nearest,
-                    "token_nearest_conf": token_nearest_conf,
-                    "seq_logits": out["seq_logits"][sample_idx].detach().cpu().tolist(),
-                    "token_probs": out["token_probs"][sample_idx].detach().cpu().tolist(),
-                    "top_seq_labels": decoded["top_seq_labels"],
-                }
-                with open(log_jsonl_path, "a") as f:
-                    f.write(json.dumps(record) + "\n")
 
-        # ---- VALIDATE ----
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
             for step, batch in enumerate(val_loader):
                 ids = batch["input_ids"].to(device)
                 mask = batch["attention_mask"].to(device)
-                labels = batch["labels"].to(device)
-
-                out = model(
-                    input_ids=ids,
-                    attention_mask=mask,
-                    seq_targets=labels,
-                )
-
+                y = batch["labels"].to(device)
+                out = model(ids, mask, labels=y, bert_only=False)
                 val_loss += out["loss"].item() * ids.size(0)
-
-                if log_jsonl_path and (step % log_every == 0):
-                    sample_idx = 0
-                    text = tokenizer.decode(
-                        ids[sample_idx].tolist(), skip_special_tokens=True
+                if log_jsonl_path and step % log_every == 0:
+                    _log_step_joint(
+                        log_jsonl_path,
+                        "joint_val",
+                        epoch,
+                        step,
+                        tokenizer,
+                        ids,
+                        out,
                     )
-                    seq_color_cpu = out["seq_color"][sample_idx].detach().cpu()
-                    seq_logits_cpu = out["seq_logits"][sample_idx].detach().cpu()
-                    decoded = decode_seq_color(seq_color_cpu, seq_logits_cpu)
-                    token_colors_cpu = out["token_colors"][sample_idx].detach().cpu()
-                    token_hues = color_vectors_to_hues_deg(token_colors_cpu).tolist()
-                    token_nearest = []
-                    token_nearest_conf = []
-                    for h in token_hues:
-                        lbl, _, conf = nearest_emotion_from_hue(torch.tensor(h))
-                        token_nearest.append(lbl)
-                        token_nearest_conf.append(conf)
-                    record = {
-                        "split": "val",
-                        "epoch": epoch,
-                        "step": step,
-                        "text": text,
-                        "seq_color": out["seq_color"][sample_idx].detach().cpu().tolist(),
-                        "seq_color_decoded": decoded,
-                        "seq_rgb": decoded["rgb"],
-                        "seq_nearest_label": decoded["nearest_label"],
-                        "seq_hue_deg": decoded["hue_deg"],
-                        "seq_hue_confidence": decoded["hue_confidence"],
-                        "token_colors": out["token_colors"][sample_idx].detach().cpu().tolist(),
-                        "token_hues": token_hues,
-                        "token_nearest_labels": token_nearest,
-                        "token_nearest_conf": token_nearest_conf,
-                        "seq_logits": out["seq_logits"][sample_idx].detach().cpu().tolist(),
-                        "token_probs": out["token_probs"][sample_idx].detach().cpu().tolist(),
-                        "top_seq_labels": decoded["top_seq_labels"],
-                    }
-                    with open(log_jsonl_path, "a") as f:
-                        f.write(json.dumps(record) + "\n")
-
-        val_loss /= len(val_set)
-        print(f"[Epoch {epoch+1}] validation loss = {val_loss:.4f}")
+        val_loss /= len(val_loader.dataset)
+        print(f"[Joint epoch {epoch + 1}] val loss = {val_loss:.4f}")
 
     return model
+
+
+def train_bert_only_baseline(
+    bert_name: str = "bert-base-uncased",
+    batch_size: int = 16,
+    lr: float = 2e-5,
+    max_length: int = 128,
+    epochs: int = 3,
+    device: Optional[torch.device] = None,
+) -> BERTOnlyBaseline:
+    """Standalone baseline for evaluation comparison."""
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ds = load_dataset("SetFit/go_emotions")
+    tokenizer = AutoTokenizer.from_pretrained(bert_name)
+    train_loader = DataLoader(
+        GoEmotionsDataset(ds["train"], tokenizer, max_length),
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=2,
+        collate_fn=goemotions_collate_fn,
+    )
+    val_loader = DataLoader(
+        GoEmotionsDataset(ds["validation"], tokenizer, max_length),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=2,
+        collate_fn=goemotions_collate_fn,
+    )
+    model = BERTOnlyBaseline(bert_name).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    loss_fn = nn.BCEWithLogitsLoss()
+
+    for epoch in range(epochs):
+        model.train()
+        for batch in train_loader:
+            ids = batch["input_ids"].to(device)
+            mask = batch["attention_mask"].to(device)
+            y = batch["labels"].to(device)
+            out = model(ids, mask)
+            loss = loss_fn(out["logits"], y)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                ids = batch["input_ids"].to(device)
+                mask = batch["attention_mask"].to(device)
+                y = batch["labels"].to(device)
+                out = model(ids, mask)
+                val_loss += loss_fn(out["logits"], y).item() * ids.size(0)
+        val_loss /= len(val_loader.dataset)
+        print(f"[Baseline epoch {epoch + 1}] val loss = {val_loss:.4f}")
+
+    return model
+
+
+@torch.no_grad()
+def evaluate_model(
+    model: nn.Module,
+    split: str = "validation",
+    bert_name: str = "bert-base-uncased",
+    batch_size: int = 32,
+    max_length: int = 128,
+    device: Optional[torch.device] = None,
+    gnn_branch: str = "full",
+) -> Dict[str, float]:
+    """
+    For EmotionColorGNNBERT, set gnn_branch to:
+      - 'full': GNN + residual (same as training objective after joint phase)
+      - 'bert_only': only the frozen BERT head logits (ablation vs color-GNN path)
+    For BERTOnlyBaseline, gnn_branch is ignored.
+    """
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ds = load_dataset("SetFit/go_emotions")
+    tokenizer = AutoTokenizer.from_pretrained(bert_name)
+    loader = DataLoader(
+        GoEmotionsDataset(ds[split], tokenizer, max_length),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=2,
+        collate_fn=goemotions_collate_fn,
+    )
+    model.eval()
+    all_logits = []
+    all_labels = []
+    for batch in loader:
+        ids = batch["input_ids"].to(device)
+        mask = batch["attention_mask"].to(device)
+        y = batch["labels"].to(device)
+        if isinstance(model, EmotionColorGNNBERT):
+            bo = gnn_branch == "bert_only"
+            out = model(ids, mask, labels=None, bert_only=bo)
+        else:
+            out = model(ids, mask)
+        all_logits.append(out["logits"].cpu())
+        all_labels.append(y.cpu())
+    logits = torch.cat(all_logits, dim=0)
+    labels = torch.cat(all_labels, dim=0)
+    return multilabel_f1(logits, labels)
+
+
+def _log_step(
+    path: str,
+    split: str,
+    epoch: int,
+    step: int,
+    tokenizer,
+    input_ids: torch.Tensor,
+    out: Dict[str, Any],
+) -> None:
+    text = tokenizer.decode(input_ids[0].tolist(), skip_special_tokens=True)
+    record = {
+        "split": split,
+        "epoch": epoch,
+        "step": step,
+        "text": text,
+        "logits": out["logits"][0].detach().cpu().tolist(),
+    }
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def _log_step_joint(
+    path: str,
+    split: str,
+    epoch: int,
+    step: int,
+    tokenizer,
+    input_ids: torch.Tensor,
+    out: Dict[str, Any],
+) -> None:
+    text = tokenizer.decode(input_ids[0].tolist(), skip_special_tokens=True)
+    record = {
+        "split": split,
+        "epoch": epoch,
+        "step": step,
+        "text": text,
+        "logits": out["logits"][0].detach().cpu().tolist(),
+        "logits_bert": out["logits_bert"][0].detach().cpu().tolist(),
+        "logits_gnn": out["logits_gnn"][0].detach().cpu().tolist(),
+        "emotion_vectors": out["emotion_vectors"][0].detach().cpu().tolist(),
+    }
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def run_full_pipeline(
+    bert_name: str = "bert-base-uncased",
+    batch_size_warmup: int = 16,
+    batch_size_joint: int = 16,
+    lr_warmup: float = 2e-5,
+    lr_joint: float = 1e-3,
+    max_length: int = 128,
+    epochs_warmup: int = 3,
+    epochs_joint: int = 3,
+    device: Optional[torch.device] = None,
+    color_map_path: Optional[str] = None,
+    log_jsonl_path: Optional[str] = None,
+) -> Tuple[EmotionColorGNNBERT, Dict[str, Dict[str, float]]]:
+    """
+    Warm-up BERT head, then joint GNN + color; evaluate GNN vs BERT-only baseline.
+    """
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = train_goemotions_warmup(
+        bert_name=bert_name,
+        batch_size=batch_size_warmup,
+        lr=lr_warmup,
+        max_length=max_length,
+        epochs=epochs_warmup,
+        device=device,
+        color_map_path=color_map_path,
+        log_jsonl_path=log_jsonl_path,
+    )
+    model = train_goemotions_joint(
+        model,
+        bert_name=bert_name,
+        batch_size=batch_size_joint,
+        lr=lr_joint,
+        max_length=max_length,
+        epochs=epochs_joint,
+        device=device,
+        log_jsonl_path=log_jsonl_path,
+    )
+
+    metrics: Dict[str, Dict[str, float]] = {}
+    metrics["gnn_full"] = evaluate_model(
+        model,
+        split="validation",
+        bert_name=bert_name,
+        batch_size=32,
+        max_length=max_length,
+        device=device,
+        gnn_branch="full",
+    )
+    metrics["bert_head_only_same_checkpoint"] = evaluate_model(
+        model,
+        split="validation",
+        bert_name=bert_name,
+        batch_size=32,
+        max_length=max_length,
+        device=device,
+        gnn_branch="bert_only",
+    )
+
+    print("Validation metrics:", json.dumps(metrics, indent=2))
+    return model, metrics

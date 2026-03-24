@@ -1,0 +1,78 @@
+#!/bin/bash
+# Same as longleaf_palette.pbs — submit with: sbatch longleaf_train.pbs
+# Longleaf requires --qos=gpu_access for GPU partitions (help.rc.unc.edu/longleaf-slurm-examples).
+#
+# Avoid partition "gpu" (GTX 1080, sm_61): standard pip PyTorch builds target sm_70+ only → CUDA crashes.
+# Use volta-gpu (V100), l40-gpu, or a100-gpu instead.
+#SBATCH --job-name=PsyPec
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=23:59:59
+#SBATCH --partition=volta-gpu
+#SBATCH --qos=gpu_access
+#SBATCH --gres=gpu:1
+#SBATCH --output=/work/users/d/y/dyy12/PsyPec/logs/%x-%j.out
+#SBATCH --error=/work/users/d/y/dyy12/PsyPec/logs/%x-%j.err
+
+set -euo pipefail
+
+WORKDIR="/work/users/d/y/dyy12/PsyPec"
+cd "$WORKDIR"
+mkdir -p "$WORKDIR/logs"
+
+# Compute nodes often lack a login shell; load modules like the RC docs (module add anaconda/2024.02).
+if [[ -f /etc/profile.d/modules.sh ]]; then
+  # shellcheck source=/dev/null
+  source /etc/profile.d/modules.sh
+fi
+module purge 2>/dev/null || true
+module add anaconda/2024.02 2>/dev/null || module load anaconda/2024.02 2>/dev/null || true
+
+CONDA_ROOT="${CONDA_ROOT:-/nas/longleaf/rhel9/apps/anaconda/2024.02}"
+if [[ -f "$CONDA_ROOT/etc/profile.d/conda.sh" ]]; then
+  # shellcheck source=/dev/null
+  source "$CONDA_ROOT/etc/profile.d/conda.sh"
+fi
+# Activate is nice for env vars; PATH fallback works if conda is missing on the node.
+conda activate psypectrum 2>/dev/null || true
+export PATH="${HOME}/.conda/envs/psypectrum/bin:${PATH}"
+command -v python || { echo "No python in psypectrum env. Create it on a login node first." >&2; exit 1; }
+
+export HF_HOME="$WORKDIR/hf_cache"
+export TRANSFORMERS_CACHE="$HF_HOME/transformers"
+export HF_DATASETS_CACHE="$HF_HOME/datasets"
+mkdir -p "$TRANSFORMERS_CACHE" "$HF_DATASETS_CACHE"
+
+BERT_MODEL="bert-base-uncased"
+BATCH_WARMUP=16
+BATCH_JOINT=16
+LR_WARMUP=2e-5
+LR_JOINT=1e-3
+MAX_LEN=128
+EPOCHS_WARMUP=3
+EPOCHS_JOINT=3
+LOG_PATH="$WORKDIR/logs/palette_gnn_${SLURM_JOB_ID}.jsonl"
+
+python -u - <<PY
+import json
+import torch
+from palette_model import run_full_pipeline
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+_, metrics = run_full_pipeline(
+    bert_name="${BERT_MODEL}",
+    batch_size_warmup=${BATCH_WARMUP},
+    batch_size_joint=${BATCH_JOINT},
+    lr_warmup=${LR_WARMUP},
+    lr_joint=${LR_JOINT},
+    max_length=${MAX_LEN},
+    epochs_warmup=${EPOCHS_WARMUP},
+    epochs_joint=${EPOCHS_JOINT},
+    device=device,
+    log_jsonl_path="${LOG_PATH}",
+)
+print("Done. Metrics:", json.dumps(metrics, indent=2))
+PY

@@ -1,0 +1,12 @@
+# Same as environment.yml (cluster filename). `name` must be a short name, not a path.
+
+name: psypectrum
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+    - torch>=2.0
+    - transformers>=4.30
+    - datasets>=2.14

@@ -372,7 +372,7 @@ def multilabel_f1(
 
 
 # ---------------------------------------------------------------------------
-# 5. Training loops
+# 5. Training loops (Need adjustments)
 # ---------------------------------------------------------------------------
 
 
@@ -617,12 +617,12 @@ def evaluate_model(
     gnn_branch: str = "full",
 ) -> Dict[str, float]:
     """
-    For EmotionColorGNNBERT, set gnn_branch to:
+    For EmotionColorGNNBERTmodel, we set gnn_branch to:
       - 'full': GNN + residual (same as training objective after joint phase)
       - 'bert_only': only the frozen BERT head logits (ablation vs color-GNN path)
-    For BERTOnlyBaseline, gnn_branch is ignored.
+    For BERTOnlyBaseline, the gnn_branch is ignored for compairson purposes.
     """
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda") # Force cuda for speed up!
     ds = load_dataset("SetFit/go_emotions")
     tokenizer = AutoTokenizer.from_pretrained(bert_name)
     loader = DataLoader(

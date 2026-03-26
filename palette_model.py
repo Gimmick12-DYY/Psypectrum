@@ -474,7 +474,7 @@ def train_goemotions_joint(
     device: Optional[torch.device] = None,
     log_jsonl_path: Optional[str] = None,
     log_every: int = 200,
-) -> EmotionColorGNNBERT:
+) -> EmotionColorGNNBERT:           # NEED ADJUSTMENTS HERE: instead of just BERT head, we need BERT+GNN to compare with BERT+COLOR_GNN for a fair compairson. We can do this by adding a bert_only flag to the model forward and log both branches' outputs at each step for comparison.
     """Joint: BERT frozen; train color projection + GNN + classifier."""
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     freeze_for_joint(model)

@@ -252,6 +252,7 @@ class EmotionColorGNNBERT(nn.Module):
         attention_mask: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
         bert_only: bool = False,
+        use_color: bool = True,
     ) -> Dict[str, Any]:
         out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
         pooled = out.last_hidden_state[:, 0]
@@ -267,11 +268,19 @@ class EmotionColorGNNBERT(nn.Module):
                 "pooled": pooled,
             }
 
-        e_vec = self._emotion_vectors(logits_bert)
-        c = self.color_proj(e_vec)
         x_b = self.ln_bert(pooled)
-        x_c = self.ln_color(c)
-        x = torch.cat([x_b, x_c], dim=-1)
+        if use_color:
+            e_vec = self._emotion_vectors(logits_bert)
+            c = self.color_proj(e_vec)
+            x_c = self.ln_color(c)
+            x = torch.cat([x_b, x_c], dim=-1)
+        else:
+            # Same 896-dim layout as full model: BERT half + zeros (no color module).
+            e_vec = None
+            x = torch.cat(
+                [x_b, pooled.new_zeros(pooled.size(0), 128)],
+                dim=-1,
+            )
 
         adj = self._batch_adjacency(pooled.detach())
         h = torch.matmul(adj, x)
@@ -289,14 +298,16 @@ class EmotionColorGNNBERT(nn.Module):
         if labels is not None:
             loss = self._loss(logits, labels)
 
-        return {
+        out_dict: Dict[str, Any] = {
             "loss": loss,
             "logits": logits,
             "logits_bert": logits_bert,
             "logits_gnn": logits_gnn,
             "pooled": pooled,
-            "emotion_vectors": e_vec,
         }
+        if e_vec is not None:
+            out_dict["emotion_vectors"] = e_vec
+        return out_dict
 
     def set_bert_trainable(self, trainable: bool) -> None:
         for p in self.bert.parameters():
@@ -474,7 +485,7 @@ def train_goemotions_joint(
     device: Optional[torch.device] = None,
     log_jsonl_path: Optional[str] = None,
     log_every: int = 200,
-) -> EmotionColorGNNBERT:           # NEED ADJUSTMENTS HERE: instead of just BERT head, we need BERT+GNN to compare with BERT+COLOR_GNN for a fair compairson. We can do this by adding a bert_only flag to the model forward and log both branches' outputs at each step for comparison.
+) -> EmotionColorGNNBERT:
     """Joint: BERT frozen; train color projection + GNN + classifier."""
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     freeze_for_joint(model)
@@ -617,10 +628,12 @@ def evaluate_model(
     gnn_branch: str = "full",
 ) -> Dict[str, float]:
     """
-    For EmotionColorGNNBERTmodel, we set gnn_branch to:
-      - 'full': GNN + residual (same as training objective after joint phase)
-      - 'bert_only': only the frozen BERT head logits (ablation vs color-GNN path)
-    For BERTOnlyBaseline, the gnn_branch is ignored for compairson purposes.
+    For EmotionColorGNNBERT, gnn_branch selects the forward path:
+      - 'full' or 'bert_color_gnn': BERT + color concat + GCN + residual (trained model)
+      - 'bert_gnn' or 'gnn_no_color': same GCN stack but no color features (zeros in the
+        128-dim slot; fair ablation vs adding the color module)
+      - 'bert_only': BERT head logits only (no GNN)
+    For BERTOnlyBaseline, gnn_branch is ignored.
     """
     device = torch.device("cuda") # Force cuda for speed up!
     ds = load_dataset("SetFit/go_emotions")
@@ -640,8 +653,12 @@ def evaluate_model(
         mask = batch["attention_mask"].to(device)
         y = batch["labels"].to(device)
         if isinstance(model, EmotionColorGNNBERT):
-            bo = gnn_branch == "bert_only"
-            out = model(ids, mask, labels=None, bert_only=bo)
+            if gnn_branch == "bert_only":
+                out = model(ids, mask, labels=None, bert_only=True)
+            elif gnn_branch in ("bert_gnn", "gnn_no_color"):
+                out = model(ids, mask, labels=None, bert_only=False, use_color=False)
+            else:
+                out = model(ids, mask, labels=None, bert_only=False, use_color=True)
         else:
             out = model(ids, mask)
         all_logits.append(out["logits"].cpu())
@@ -710,7 +727,7 @@ def run_full_pipeline(
     log_jsonl_path: Optional[str] = None,
 ) -> Tuple[EmotionColorGNNBERT, Dict[str, Dict[str, float]]]:
     """
-    Warm-up BERT head, then joint GNN + color; evaluate GNN vs BERT-only baseline.
+    Warm-up BERT head, then joint GNN + color; evaluate BERT-ColorGNN vs BERT-GNN (no color).
     """
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -736,7 +753,7 @@ def run_full_pipeline(
     )
 
     metrics: Dict[str, Dict[str, float]] = {}
-    metrics["gnn_full"] = evaluate_model(
+    metrics["bert_color_gnn"] = evaluate_model(
         model,
         split="validation",
         bert_name=bert_name,
@@ -745,14 +762,14 @@ def run_full_pipeline(
         device=device,
         gnn_branch="full",
     )
-    metrics["bert_head_only_same_checkpoint"] = evaluate_model(
+    metrics["bert_gnn"] = evaluate_model(
         model,
         split="validation",
         bert_name=bert_name,
         batch_size=32,
         max_length=max_length,
         device=device,
-        gnn_branch="bert_only",
+        gnn_branch="bert_gnn",
     )
 
     print("Validation metrics:", json.dumps(metrics, indent=2))

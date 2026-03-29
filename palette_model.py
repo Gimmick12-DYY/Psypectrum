@@ -725,9 +725,13 @@ def run_full_pipeline(
     device: Optional[torch.device] = None,
     color_map_path: Optional[str] = None,
     log_jsonl_path: Optional[str] = None,
+    metrics_plot_path: Optional[str] = None,
 ) -> Tuple[EmotionColorGNNBERT, Dict[str, Dict[str, float]]]:
     """
     Warm-up BERT head, then joint GNN + color; evaluate BERT-ColorGNN vs BERT-GNN (no color).
+
+    If ``metrics_plot_path`` is set (e.g. ``logs/metrics.png``), saves a figure from
+    ``metrics_viz`` (requires matplotlib).
     """
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -773,4 +777,18 @@ def run_full_pipeline(
     )
 
     print("Validation metrics:", json.dumps(metrics, indent=2))
+
+    if metrics_plot_path:
+        try:
+            from metrics_viz import save_pipeline_metrics_figure
+
+            save_pipeline_metrics_figure(
+                metrics,
+                metrics_plot_path,
+                suptitle="GoEmotions validation",
+            )
+            print(f"Saved metrics figure to {metrics_plot_path}")
+        except ImportError as exc:
+            print(f"Skipping metrics plot (install matplotlib): {exc}")
+
     return model, metrics

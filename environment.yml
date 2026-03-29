@@ -12,3 +12,5 @@ dependencies:
     - torch>=2.0
     - transformers>=4.30
     - datasets>=2.14
+    - matplotlib>=3.8
+    - numpy>=1.26

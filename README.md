@@ -8,6 +8,7 @@ Training is two-stage: warm up BERT and the linear head while the GNN is frozen,
 
 - Python 3.12
 - PyTorch 2.x, Hugging Face `transformers` and `datasets`
+- Matplotlib and NumPy (for metric figures)
 - GPU strongly recommended (training and evaluation are CUDA-oriented in practice)
 
 ## Setup
@@ -46,6 +47,7 @@ model, metrics = run_full_pipeline(
     epochs_joint=3,
     device=device,
     log_jsonl_path="logs/run.jsonl",  # optional: JSONL logs with logits during joint training
+    metrics_plot_path="logs/metrics.png",  # optional: grouped bars, delta, heatmap (needs matplotlib)
 )
 ```
 
@@ -64,6 +66,35 @@ A plain **BERT pooled + linear** baseline is available as `train_bert_only_basel
 
 Validation metrics use **micro** precision, recall, and F1 over all labels and examples: sigmoid on logits, threshold 0.5, then aggregate true/false positives and negatives (implemented in `multilabel_f1`).
 
+### Visualization
+
+[metrics_viz.py](metrics_viz.py) turns the nested metrics dict into one PNG with three panels:
+
+1. **Grouped bar chart** — micro precision, recall, and F1 side by side for each model branch (`BERT + Color GNN` vs `BERT + GNN (no color)`).
+2. **Delta chart** — bar length is the difference *full color model minus no-color GNN* so you can see whether the color module helps on each metric.
+3. **Heatmap** — the same numbers in a 2×3 grid with a shared 0–1 color scale.
+
+Pass `metrics_plot_path` into `run_full_pipeline` to save automatically, or call directly after any evaluation:
+
+```python
+from metrics_viz import plot_validation_metrics, save_pipeline_metrics_figure
+
+save_pipeline_metrics_figure(metrics, "logs/val_metrics.png")
+# Or: plot_validation_metrics(metrics, save_path="logs/val_metrics.png"); use show=True to display
+```
+
+```mermaid
+flowchart TB
+  subgraph panels [metrics figure]
+    A["Grouped bars: P, R, F1 per branch"]
+    B["Δ bars: color GNN minus no-color GNN"]
+    C["Heatmap: branches × metrics"]
+  end
+  M[metrics dict] --> A
+  M --> B
+  M --> C
+```
+
 ## Cluster jobs (example)
 
 [longleaf_train.pbs](longleaf_train.pbs) and [longleaf_palette.pbs](longleaf_palette.pbs) are Slurm job scripts tailored to UNC Longleaf: adjust `WORKDIR`, log paths, and partition/QOS to match your account and cluster documentation (for example [Longleaf Slurm examples](https://help.rc.unc.edu/longleaf-slurm-examples/)). Submit with `sbatch longleaf_train.pbs` after editing paths and loading your conda environment on a login node.
@@ -73,5 +104,6 @@ Validation metrics use **micro** precision, recall, and F1 over all labels and e
 | Path | Role |
 | --- | --- |
 | [palette_model.py](palette_model.py) | Dataset, `EmotionColorGNNBERT`, training loops, evaluation, `run_full_pipeline` |
+| [metrics_viz.py](metrics_viz.py) | Matplotlib figures for validation metrics |
 | [COLOR_MAP.txt](COLOR_MAP.txt) | Per-label valence and hue for the color branch |
 | [environment.yml](environment.yml) | Conda environment definition |

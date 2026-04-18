@@ -62,6 +62,25 @@ For programmatic evaluation with other splits or branches, use `evaluate_model(.
 
 A plain **BERT pooled + linear** baseline is available as `train_bert_only_baseline` / `BERTOnlyBaseline` in [palette_model.py](palette_model.py).
 
+### Training knobs for recall / precision / F1
+
+`run_full_pipeline` exposes the improvements we rolled in after the first 0.585 F1 run. Defaults are listed first.
+
+| Knob | Default | What it does |
+| --- | --- | --- |
+| `loss_type` | `"asl"` | Asymmetric multi-label loss (Ben-Baruch et al.). Also supports `"bce"`, `"bce_weighted"` (auto pos_weight from train split), and `"focal"`. |
+| `asl_gamma_pos` / `asl_gamma_neg` / `asl_clip` | `0.0 / 4.0 / 0.05` | ASL hyperparameters; stronger negative focusing helps rare-label recall. |
+| `color_teacher_prob` | `0.5` | During training, each example uses ground-truth labels to build the color vector with this probability (otherwise predicted probs). Breaks the "color is a deterministic copy of BERT" problem. |
+| `adj_temperature` | `0.25` | Sharper softmax over cosine similarities; less feature bleed across unrelated batch members. |
+| `adj_topk` | `8` | Top-k sparsification of the batch graph. |
+| `n_top_bert_layers` / `bert_lr_joint` | `2 / 2e-5` | Unfreeze the top N BERT transformer blocks during the joint phase with a small LR (discriminative learning rate). |
+| `weight_decay` | `0.01` | AdamW weight decay, applied to non-bias/LayerNorm weights. |
+| `max_grad_norm` | `1.0` | Gradient clipping. |
+| `warmup_ratio` | `0.1` | Fraction of steps for linear LR warmup (rest is linear decay). |
+| `early_stop` | `True` | Track best joint-phase validation micro-F1 and restore that `state_dict` before returning. |
+
+`label_color_vectors` is a trainable `nn.Parameter` initialized from `COLOR_MAP.txt`, so the color branch can move away from the deterministic initialization during joint training.
+
 ## Metrics
 
 Validation metrics use **micro** precision, recall, and F1 over all labels and examples: sigmoid on logits, threshold 0.5, then aggregate true/false positives and negatives (implemented in `multilabel_f1`).

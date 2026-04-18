@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from datasets import load_dataset
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warmup
 
 
 # ---------------------------------------------------------------------------
@@ -160,8 +160,66 @@ def goemotions_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, tor
 
 
 # ---------------------------------------------------------------------------
-# 3. Models
+# 3. Models + losses
 # ---------------------------------------------------------------------------
+
+
+class AsymmetricLoss(nn.Module):
+    """
+    Asymmetric multi-label loss (Ben-Baruch et al., ICCV 2021).
+
+    Defaults follow the ASL paper: ``gamma_neg=4``, ``gamma_pos=0``, ``clip=0.05``.
+    Down-weights easy negatives and probability-mass on already-confident negatives,
+    which helps imbalanced multi-label setups like GoEmotions.
+    """
+
+    def __init__(
+        self,
+        gamma_pos: float = 0.0,
+        gamma_neg: float = 4.0,
+        clip: float = 0.05,
+        eps: float = 1e-8,
+    ) -> None:
+        super().__init__()
+        self.gamma_pos = gamma_pos
+        self.gamma_neg = gamma_neg
+        self.clip = clip
+        self.eps = eps
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        p = torch.sigmoid(logits)
+        p_neg = 1.0 - p
+        if self.clip > 0:
+            p_neg = (p_neg + self.clip).clamp(max=1.0)
+        los_pos = targets * torch.log(p.clamp(min=self.eps))
+        los_neg = (1.0 - targets) * torch.log(p_neg.clamp(min=self.eps))
+        loss = los_pos + los_neg
+        if self.gamma_pos > 0 or self.gamma_neg > 0:
+            pt = p * targets + p_neg * (1.0 - targets)
+            gamma = self.gamma_pos * targets + self.gamma_neg * (1.0 - targets)
+            loss = loss * torch.pow(1.0 - pt, gamma)
+        return -loss.mean()
+
+
+def compute_pos_weight(hf_split) -> torch.Tensor:
+    """
+    Compute BCE ``pos_weight`` = N_neg / N_pos per label on a GoEmotions split.
+    Returns a tensor of shape ``(NUM_LABELS,)``.
+    """
+    total = len(hf_split)
+    pos = torch.zeros(NUM_LABELS)
+    for row in hf_split:
+        pos += torch.tensor(
+            [float(row[label]) for label in GOEMOTIONS_LABELS],
+            dtype=torch.float32,
+        )
+    pos = pos.clamp(min=1.0)
+    neg = (total - pos).clamp(min=1.0)
+    return neg / pos
 
 
 class BERTOnlyBaseline(nn.Module):
@@ -198,8 +256,16 @@ class EmotionColorGNNBERT(nn.Module):
         color_map_path: Optional[str] = None,
         gcn_hidden: int = 896,
         num_labels: int = NUM_LABELS,
-        adj_temperature: float = 1.0,
+        adj_temperature: float = 0.25,
+        adj_topk: Optional[int] = None,
         use_residual: bool = True,
+        color_teacher_prob: float = 0.5,
+        loss_type: str = "asl",
+        pos_weight: Optional[torch.Tensor] = None,
+        asl_gamma_pos: float = 0.0,
+        asl_gamma_neg: float = 4.0,
+        asl_clip: float = 0.05,
+        focal_gamma: float = 2.0,
     ):
         super().__init__()
         self.bert = AutoModel.from_pretrained(bert_name)
@@ -208,7 +274,9 @@ class EmotionColorGNNBERT(nn.Module):
 
         cmap = load_color_map(color_map_path or default_color_map_path())
         table = _label_color_table(cmap)
-        self.register_buffer("label_color_vectors", table)
+        # Trainable label color embeddings (initialized from COLOR_MAP); allows the
+        # color branch to carry signal not already encoded by the BERT head.
+        self.label_color_vectors = nn.Parameter(table.clone())
 
         self.ln_bert = nn.LayerNorm(hidden)
         self.color_proj = nn.Sequential(
@@ -223,28 +291,92 @@ class EmotionColorGNNBERT(nn.Module):
         self.gnn_classifier = nn.Linear(gcn_hidden, num_labels)
 
         self.adj_temperature = adj_temperature
+        self.adj_topk = adj_topk
         self.use_residual = use_residual
         self.residual_scale = nn.Parameter(torch.tensor(1.0))
 
-        self._loss = nn.BCEWithLogitsLoss()
+        # Probability of using ground-truth labels (teacher forcing) for the color
+        # vector during training; set to 0 to always use predicted probs.
+        self.color_teacher_prob = color_teacher_prob
+
+        self.loss_type = loss_type
+        if loss_type == "bce":
+            self._loss = nn.BCEWithLogitsLoss()
+        elif loss_type == "bce_weighted":
+            if pos_weight is None:
+                raise ValueError("loss_type='bce_weighted' requires pos_weight")
+            self.register_buffer("pos_weight", pos_weight.clone())
+            self._loss = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
+        elif loss_type == "asl":
+            self._loss = AsymmetricLoss(
+                gamma_pos=asl_gamma_pos,
+                gamma_neg=asl_gamma_neg,
+                clip=asl_clip,
+            )
+        elif loss_type == "focal":
+            # Focal is a special case of ASL with symmetric gammas and no clip.
+            self._loss = AsymmetricLoss(
+                gamma_pos=focal_gamma,
+                gamma_neg=focal_gamma,
+                clip=0.0,
+            )
+        else:
+            raise ValueError(f"Unknown loss_type: {loss_type}")
 
     def _batch_adjacency(self, pooled: torch.Tensor) -> torch.Tensor:
-        """Row-normalized softmax similarity + self-loop (B, B)."""
+        """
+        Softmax similarity + self-loop (B, B). Optionally top-k sparsified to avoid
+        spreading each node's features across unrelated batch members.
+        """
         z = F.normalize(pooled, p=2, dim=-1)
         sim = torch.matmul(z, z.transpose(0, 1)) / self.adj_temperature
+
+        b = sim.size(0)
+        if self.adj_topk is not None and 0 < self.adj_topk < b:
+            topk_vals, topk_idx = sim.topk(self.adj_topk, dim=-1)
+            sparse = torch.full_like(sim, float("-inf"))
+            sparse.scatter_(-1, topk_idx, topk_vals)
+            sim = sparse
+
         adj = F.softmax(sim, dim=-1)
-        b = adj.size(0)
         eye = torch.eye(b, device=adj.device, dtype=adj.dtype)
         adj = adj + eye
         adj = adj / (adj.sum(dim=-1, keepdim=True) + 1e-8)
         return adj
 
-    def _emotion_vectors(self, logits_bert: torch.Tensor) -> torch.Tensor:
+    def _emotion_vectors(
+        self,
+        logits_bert: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Weighted sum over ``label_color_vectors``.
+
+        If ``labels`` is provided and we're in training mode, each example uses the
+        teacher-forced label distribution with probability ``color_teacher_prob``
+        (and the predicted sigmoid distribution otherwise). This gives the color
+        branch a signal that isn't just a deterministic copy of the BERT head.
+        """
         probs = torch.sigmoid(logits_bert)
         mass = probs.sum(dim=-1, keepdim=True) + 1e-8
-        w = probs / mass
-        e = torch.matmul(w, self.label_color_vectors)
-        return e
+        w_pred = probs / mass
+
+        if (
+            self.training
+            and labels is not None
+            and self.color_teacher_prob > 0.0
+        ):
+            lab_mass = labels.sum(dim=-1, keepdim=True) + 1e-8
+            w_lab = labels / lab_mass
+            use_teacher = (
+                torch.rand(labels.size(0), 1, device=labels.device)
+                < self.color_teacher_prob
+            ).float()
+            w = use_teacher * w_lab + (1.0 - use_teacher) * w_pred
+        else:
+            w = w_pred
+
+        return torch.matmul(w, self.label_color_vectors)
 
     def forward(
         self,
@@ -270,7 +402,7 @@ class EmotionColorGNNBERT(nn.Module):
 
         x_b = self.ln_bert(pooled)
         if use_color:
-            e_vec = self._emotion_vectors(logits_bert)
+            e_vec = self._emotion_vectors(logits_bert, labels=labels)
             c = self.color_proj(e_vec)
             x_c = self.ln_color(c)
             x = torch.cat([x_b, x_c], dim=-1)
@@ -350,10 +482,34 @@ def freeze_for_joint(model: EmotionColorGNNBERT) -> None:
     for p in model.gnn_classifier.parameters():
         p.requires_grad = True
     model.residual_scale.requires_grad = True
+    model.label_color_vectors.requires_grad = True
 
 
 def unfreeze_bert(model: EmotionColorGNNBERT) -> None:
     model.set_bert_trainable(True)
+
+
+def unfreeze_top_bert_layers(model: EmotionColorGNNBERT, n_layers: int) -> List[nn.Parameter]:
+    """
+    Unfreeze the top ``n_layers`` transformer blocks of ``model.bert`` (and the
+    pooler if present) for fine-grained joint training with a small LR.
+    Returns the list of newly-trainable parameters for use in a distinct optimizer
+    param group.
+    """
+    if n_layers <= 0:
+        return []
+    encoder_layers = model.bert.encoder.layer
+    top = encoder_layers[-n_layers:]
+    params: List[nn.Parameter] = []
+    for layer in top:
+        for p in layer.parameters():
+            p.requires_grad = True
+            params.append(p)
+    if hasattr(model.bert, "pooler") and model.bert.pooler is not None:
+        for p in model.bert.pooler.parameters():
+            p.requires_grad = True
+            params.append(p)
+    return params
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +553,10 @@ def train_goemotions_warmup(
     color_map_path: Optional[str] = None,
     log_jsonl_path: Optional[str] = None,
     log_every: int = 200,
+    weight_decay: float = 0.01,
+    max_grad_norm: float = 1.0,
+    warmup_ratio: float = 0.1,
+    model_kwargs: Optional[Dict[str, Any]] = None,
 ) -> EmotionColorGNNBERT:
     """Train BERT + bert_head only (GNN path skipped via bert_only=True)."""
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -417,14 +577,26 @@ def train_goemotions_warmup(
         collate_fn=goemotions_collate_fn,
     )
 
+    mk: Dict[str, Any] = dict(model_kwargs or {})
+    # Auto-compute pos_weight from the train split if the caller asked for it.
+    if mk.get("loss_type") == "bce_weighted" and "pos_weight" not in mk:
+        mk["pos_weight"] = compute_pos_weight(ds["train"])
+
     model = EmotionColorGNNBERT(
         bert_name=bert_name,
         color_map_path=color_map_path,
+        **mk,
     ).to(device)
     freeze_gnn_for_warmup(model)
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=lr,
+
+    named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    param_groups = _build_param_groups(named, base_lr=lr, weight_decay=weight_decay)
+    optimizer = torch.optim.AdamW(param_groups)
+
+    total_steps = max(1, len(train_loader) * epochs)
+    warmup_steps = max(1, int(total_steps * warmup_ratio))
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
     )
 
     for epoch in range(epochs):
@@ -437,7 +609,13 @@ def train_goemotions_warmup(
             loss = out["loss"]
             optimizer.zero_grad()
             loss.backward()
+            if max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad],
+                    max_grad_norm,
+                )
             optimizer.step()
+            scheduler.step()
 
             if log_jsonl_path and step % log_every == 0:
                 _log_step(
@@ -475,6 +653,52 @@ def train_goemotions_warmup(
     return model
 
 
+def _build_param_groups(
+    named_params: List[Tuple[str, nn.Parameter]],
+    base_lr: float,
+    weight_decay: float,
+    bert_lr: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Split parameters into decay / no-decay groups and optionally a lower-LR BERT
+    group. Excludes bias and LayerNorm weights from weight decay (standard practice).
+    """
+    no_decay_substrings = ("bias", "LayerNorm.weight", "layer_norm.weight", "ln_bert", "ln_color")
+
+    def is_no_decay(name: str) -> bool:
+        return any(s in name for s in no_decay_substrings)
+
+    groups: Dict[Tuple[bool, bool], List[nn.Parameter]] = {
+        (False, False): [],
+        (False, True): [],
+        (True, False): [],
+        (True, True): [],
+    }
+    for name, p in named_params:
+        if not p.requires_grad:
+            continue
+        nd = is_no_decay(name)
+        is_bert = name.startswith("bert.")
+        groups[(is_bert, nd)].append(p)
+
+    out: List[Dict[str, Any]] = []
+    if groups[(False, False)]:
+        out.append({"params": groups[(False, False)], "lr": base_lr, "weight_decay": weight_decay})
+    if groups[(False, True)]:
+        out.append({"params": groups[(False, True)], "lr": base_lr, "weight_decay": 0.0})
+    if bert_lr is not None and (groups[(True, False)] or groups[(True, True)]):
+        if groups[(True, False)]:
+            out.append({"params": groups[(True, False)], "lr": bert_lr, "weight_decay": weight_decay})
+        if groups[(True, True)]:
+            out.append({"params": groups[(True, True)], "lr": bert_lr, "weight_decay": 0.0})
+    else:
+        if groups[(True, False)]:
+            out.append({"params": groups[(True, False)], "lr": base_lr, "weight_decay": weight_decay})
+        if groups[(True, True)]:
+            out.append({"params": groups[(True, True)], "lr": base_lr, "weight_decay": 0.0})
+    return out
+
+
 def train_goemotions_joint(
     model: EmotionColorGNNBERT,
     bert_name: str = "bert-base-uncased",
@@ -485,10 +709,24 @@ def train_goemotions_joint(
     device: Optional[torch.device] = None,
     log_jsonl_path: Optional[str] = None,
     log_every: int = 200,
+    weight_decay: float = 0.01,
+    max_grad_norm: float = 1.0,
+    warmup_ratio: float = 0.1,
+    n_top_bert_layers: int = 2,
+    bert_lr: float = 2e-5,
+    early_stop: bool = True,
 ) -> EmotionColorGNNBERT:
-    """Joint: BERT frozen; train color projection + GNN + classifier."""
+    """
+    Joint training: BERT body frozen except the top ``n_top_bert_layers`` blocks
+    (fine-tuned at ``bert_lr``). Trains color + GCN + classifier at ``lr`` with
+    AdamW (weight decay 0.01, LayerNorm/bias excluded), linear warmup +
+    decay schedule, and gradient clipping. Tracks best validation micro-F1 and
+    restores those weights before returning if ``early_stop`` is set.
+    """
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     freeze_for_joint(model)
+    bert_params = unfreeze_top_bert_layers(model, n_top_bert_layers)
+    bert_param_ids = {id(p) for p in bert_params}
 
     ds = load_dataset("SetFit/go_emotions")
     tokenizer = AutoTokenizer.from_pretrained(bert_name)
@@ -507,10 +745,23 @@ def train_goemotions_joint(
         collate_fn=goemotions_collate_fn,
     )
 
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=lr,
+    named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    param_groups = _build_param_groups(
+        named,
+        base_lr=lr,
+        weight_decay=weight_decay,
+        bert_lr=bert_lr if bert_param_ids else None,
     )
+    optimizer = torch.optim.AdamW(param_groups)
+
+    total_steps = max(1, len(train_loader) * epochs)
+    warmup_steps = max(1, int(total_steps * warmup_ratio))
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
+    )
+
+    best_f1 = -1.0
+    best_state: Optional[Dict[str, torch.Tensor]] = None
 
     for epoch in range(epochs):
         model.train()
@@ -522,7 +773,13 @@ def train_goemotions_joint(
             loss = out["loss"]
             optimizer.zero_grad()
             loss.backward()
+            if max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad],
+                    max_grad_norm,
+                )
             optimizer.step()
+            scheduler.step()
 
             if log_jsonl_path and step % log_every == 0:
                 _log_step_joint(
@@ -536,6 +793,8 @@ def train_goemotions_joint(
                 )
 
         model.eval()
+        val_logits: List[torch.Tensor] = []
+        val_labels: List[torch.Tensor] = []
         val_loss = 0.0
         with torch.no_grad():
             for step, batch in enumerate(val_loader):
@@ -544,6 +803,8 @@ def train_goemotions_joint(
                 y = batch["labels"].to(device)
                 out = model(ids, mask, labels=y, bert_only=False)
                 val_loss += out["loss"].item() * ids.size(0)
+                val_logits.append(out["logits"].detach().cpu())
+                val_labels.append(y.detach().cpu())
                 if log_jsonl_path and step % log_every == 0:
                     _log_step_joint(
                         log_jsonl_path,
@@ -555,7 +816,19 @@ def train_goemotions_joint(
                         out,
                     )
         val_loss /= len(val_loader.dataset)
-        print(f"[Joint epoch {epoch + 1}] val loss = {val_loss:.4f}")
+        m = multilabel_f1(torch.cat(val_logits), torch.cat(val_labels))
+        print(
+            f"[Joint epoch {epoch + 1}] val loss = {val_loss:.4f} | "
+            f"P={m['micro_precision']:.4f} R={m['micro_recall']:.4f} F1={m['micro_f1']:.4f}"
+        )
+        if m["micro_f1"] > best_f1:
+            best_f1 = m["micro_f1"]
+            if early_stop:
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    if early_stop and best_state is not None:
+        print(f"[Joint] Restoring best weights (val micro-F1 = {best_f1:.4f})")
+        model.load_state_dict(best_state)
 
     return model
 
@@ -707,8 +980,9 @@ def _log_step_joint(
         "logits": out["logits"][0].detach().cpu().tolist(),
         "logits_bert": out["logits_bert"][0].detach().cpu().tolist(),
         "logits_gnn": out["logits_gnn"][0].detach().cpu().tolist(),
-        "emotion_vectors": out["emotion_vectors"][0].detach().cpu().tolist(),
     }
+    if "emotion_vectors" in out:
+        record["emotion_vectors"] = out["emotion_vectors"][0].detach().cpu().tolist()
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
 
@@ -726,14 +1000,47 @@ def run_full_pipeline(
     color_map_path: Optional[str] = None,
     log_jsonl_path: Optional[str] = None,
     metrics_plot_path: Optional[str] = None,
+    # ---- New knobs (items 2–5 of the improvement plan) ----
+    loss_type: str = "asl",
+    asl_gamma_pos: float = 0.0,
+    asl_gamma_neg: float = 4.0,
+    asl_clip: float = 0.05,
+    color_teacher_prob: float = 0.5,
+    adj_temperature: float = 0.25,
+    adj_topk: Optional[int] = 8,
+    weight_decay: float = 0.01,
+    max_grad_norm: float = 1.0,
+    warmup_ratio: float = 0.1,
+    n_top_bert_layers: int = 2,
+    bert_lr_joint: float = 2e-5,
+    early_stop: bool = True,
 ) -> Tuple[EmotionColorGNNBERT, Dict[str, Dict[str, float]]]:
     """
     Warm-up BERT head, then joint GNN + color; evaluate BERT-ColorGNN vs BERT-GNN (no color).
+
+    Notable defaults (vs the original pipeline):
+      - ``loss_type='asl'``: asymmetric multi-label loss (better for imbalance).
+      - ``color_teacher_prob=0.5``: during training, half the batch uses ground-truth
+        labels to compute color features so the color branch carries new signal.
+      - ``adj_temperature=0.25`` and ``adj_topk=8``: sharper, sparser batch graph.
+      - Joint phase unfreezes the top ``n_top_bert_layers`` BERT blocks at
+        ``bert_lr_joint`` and uses linear warmup + decay, weight decay, grad clipping,
+        and best-F1 early stopping.
 
     If ``metrics_plot_path`` is set (e.g. ``logs/metrics.png``), saves a figure from
     ``metrics_viz`` (requires matplotlib).
     """
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model_kwargs: Dict[str, Any] = {
+        "adj_temperature": adj_temperature,
+        "adj_topk": adj_topk,
+        "color_teacher_prob": color_teacher_prob,
+        "loss_type": loss_type,
+        "asl_gamma_pos": asl_gamma_pos,
+        "asl_gamma_neg": asl_gamma_neg,
+        "asl_clip": asl_clip,
+    }
 
     model = train_goemotions_warmup(
         bert_name=bert_name,
@@ -744,6 +1051,10 @@ def run_full_pipeline(
         device=device,
         color_map_path=color_map_path,
         log_jsonl_path=log_jsonl_path,
+        weight_decay=weight_decay,
+        max_grad_norm=max_grad_norm,
+        warmup_ratio=warmup_ratio,
+        model_kwargs=model_kwargs,
     )
     model = train_goemotions_joint(
         model,
@@ -754,6 +1065,12 @@ def run_full_pipeline(
         epochs=epochs_joint,
         device=device,
         log_jsonl_path=log_jsonl_path,
+        weight_decay=weight_decay,
+        max_grad_norm=max_grad_norm,
+        warmup_ratio=warmup_ratio,
+        n_top_bert_layers=n_top_bert_layers,
+        bert_lr=bert_lr_joint,
+        early_stop=early_stop,
     )
 
     metrics: Dict[str, Dict[str, float]] = {}

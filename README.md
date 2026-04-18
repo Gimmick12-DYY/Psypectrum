@@ -64,22 +64,24 @@ A plain **BERT pooled + linear** baseline is available as `train_bert_only_basel
 
 ### Training knobs for recall / precision / F1
 
-`run_full_pipeline` exposes the improvements we rolled in after the first 0.585 F1 run. Defaults are listed first.
+`run_full_pipeline` keeps the core BERT + color-injected batch-GNN framework. The knobs below are all opt-in variations; defaults below target calibrated predictions at a fixed 0.5 decision threshold (no post-hoc threshold tuning).
 
 | Knob | Default | What it does |
 | --- | --- | --- |
-| `loss_type` | `"asl"` | Asymmetric multi-label loss (Ben-Baruch et al.). Also supports `"bce"`, `"bce_weighted"` (auto pos_weight from train split), and `"focal"`. |
-| `asl_gamma_pos` / `asl_gamma_neg` / `asl_clip` | `0.0 / 4.0 / 0.05` | ASL hyperparameters; stronger negative focusing helps rare-label recall. |
-| `color_teacher_prob` | `0.5` | During training, each example uses ground-truth labels to build the color vector with this probability (otherwise predicted probs). Breaks the "color is a deterministic copy of BERT" problem. |
-| `adj_temperature` | `0.25` | Sharper softmax over cosine similarities; less feature bleed across unrelated batch members. |
-| `adj_topk` | `8` | Top-k sparsification of the batch graph. |
+| `loss_type` | `"bce"` | Binary cross-entropy. Also supports `"bce_weighted"` (auto pos_weight, clipped), `"asl"` (asymmetric multi-label loss), and `"focal"`. |
+| `color_loss_weight` | `0.1` | Weight on an auxiliary MSE loss: `color_head(pooled) -> 3D` vs the label-averaged color mixture from `COLOR_MAP.txt`. Gives the color map a real supervision signal without train/eval mismatch. |
+| `color_anchor_weight` | `1e-3` | L2 pull on the trainable `label_color_vectors` toward the `COLOR_MAP.txt` initialization. Keeps the hand-designed color geometry while allowing mild refinement. |
+| `color_teacher_prob` | `0.0` | Off by default. If >0, during training each example builds the color vector from ground-truth labels with this probability. Kept for ablation studies. |
+| `adj_temperature` | `1.0` | Temperature on the batch graph softmax. |
+| `adj_topk` | `None` | Optional top-k sparsification of the batch graph. |
 | `n_top_bert_layers` / `bert_lr_joint` | `2 / 2e-5` | Unfreeze the top N BERT transformer blocks during the joint phase with a small LR (discriminative learning rate). |
 | `weight_decay` | `0.01` | AdamW weight decay, applied to non-bias/LayerNorm weights. |
 | `max_grad_norm` | `1.0` | Gradient clipping. |
 | `warmup_ratio` | `0.1` | Fraction of steps for linear LR warmup (rest is linear decay). |
 | `early_stop` | `True` | Track best joint-phase validation micro-F1 and restore that `state_dict` before returning. |
+| `asl_gamma_pos` / `asl_gamma_neg` / `asl_clip` | `0.0 / 4.0 / 0.05` | ASL hyperparameters (only used when `loss_type="asl"`). |
 
-`label_color_vectors` is a trainable `nn.Parameter` initialized from `COLOR_MAP.txt`, so the color branch can move away from the deterministic initialization during joint training.
+`label_color_vectors` is a trainable `nn.Parameter` initialized from `COLOR_MAP.txt`; the anchor loss keeps it close to that initialization unless you relax `color_anchor_weight`.
 
 ## Metrics
 

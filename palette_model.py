@@ -256,16 +256,19 @@ class EmotionColorGNNBERT(nn.Module):
         color_map_path: Optional[str] = None,
         gcn_hidden: int = 896,
         num_labels: int = NUM_LABELS,
-        adj_temperature: float = 0.25,
+        adj_temperature: float = 1.0,
         adj_topk: Optional[int] = None,
         use_residual: bool = True,
-        color_teacher_prob: float = 0.5,
-        loss_type: str = "asl",
+        color_teacher_prob: float = 0.0,
+        loss_type: str = "bce",
         pos_weight: Optional[torch.Tensor] = None,
+        pos_weight_clip: float = 3.0,
         asl_gamma_pos: float = 0.0,
         asl_gamma_neg: float = 4.0,
         asl_clip: float = 0.05,
         focal_gamma: float = 2.0,
+        color_loss_weight: float = 0.1,
+        color_anchor_weight: float = 1e-3,
     ):
         super().__init__()
         self.bert = AutoModel.from_pretrained(bert_name)
@@ -274,9 +277,11 @@ class EmotionColorGNNBERT(nn.Module):
 
         cmap = load_color_map(color_map_path or default_color_map_path())
         table = _label_color_table(cmap)
-        # Trainable label color embeddings (initialized from COLOR_MAP); allows the
-        # color branch to carry signal not already encoded by the BERT head.
+        # Trainable label color embeddings (initialized from COLOR_MAP); anchored
+        # to the hand-designed geometry via ``color_anchor_weight`` so they can
+        # refine but not drift.
         self.label_color_vectors = nn.Parameter(table.clone())
+        self.register_buffer("label_color_vectors_init", table.clone())
 
         self.ln_bert = nn.LayerNorm(hidden)
         self.color_proj = nn.Sequential(
@@ -284,6 +289,13 @@ class EmotionColorGNNBERT(nn.Module):
             nn.GELU(),
         )
         self.ln_color = nn.LayerNorm(128)
+
+        # Auxiliary head: predict the label-averaged color coordinate from pooled
+        # BERT. Targets use ground-truth labels only during training; eval never
+        # uses labels (no train/eval mismatch).
+        self.color_head = nn.Linear(hidden, 3)
+        self.color_loss_weight = color_loss_weight
+        self.color_anchor_weight = color_anchor_weight
 
         concat_dim = hidden + 128
         self.gcn1 = nn.Linear(concat_dim, gcn_hidden)
@@ -295,8 +307,8 @@ class EmotionColorGNNBERT(nn.Module):
         self.use_residual = use_residual
         self.residual_scale = nn.Parameter(torch.tensor(1.0))
 
-        # Probability of using ground-truth labels (teacher forcing) for the color
-        # vector during training; set to 0 to always use predicted probs.
+        # Teacher forcing is disabled by default to avoid train/eval mismatch.
+        # Kept as an off-by-default option for ablation studies.
         self.color_teacher_prob = color_teacher_prob
 
         self.loss_type = loss_type
@@ -305,6 +317,8 @@ class EmotionColorGNNBERT(nn.Module):
         elif loss_type == "bce_weighted":
             if pos_weight is None:
                 raise ValueError("loss_type='bce_weighted' requires pos_weight")
+            if pos_weight_clip is not None and pos_weight_clip > 0:
+                pos_weight = pos_weight.clamp(max=pos_weight_clip)
             self.register_buffer("pos_weight", pos_weight.clone())
             self._loss = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
         elif loss_type == "asl":
@@ -378,6 +392,25 @@ class EmotionColorGNNBERT(nn.Module):
 
         return torch.matmul(w, self.label_color_vectors)
 
+    def _color_aux_loss(
+        self,
+        pooled: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Auxiliary color reconstruction: predict the label-averaged color vector
+        from pooled BERT, target = mean of ground-truth label colors. Uses the
+        anchored (init) label colors as the target so the supervision reflects
+        the hand-designed geometry, not transiently drifted values.
+        """
+        mass = labels.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        target = (labels @ self.label_color_vectors_init) / mass
+        pred = self.color_head(pooled)
+        return F.mse_loss(pred, target)
+
+    def _color_anchor_loss(self) -> torch.Tensor:
+        return F.mse_loss(self.label_color_vectors, self.label_color_vectors_init)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -427,11 +460,24 @@ class EmotionColorGNNBERT(nn.Module):
             logits = logits_gnn
 
         loss = None
+        loss_cls = None
+        loss_color = None
+        loss_anchor = None
         if labels is not None:
-            loss = self._loss(logits, labels)
+            loss_cls = self._loss(logits, labels)
+            loss = loss_cls
+            if use_color and self.color_loss_weight > 0.0:
+                loss_color = self._color_aux_loss(pooled, labels)
+                loss = loss + self.color_loss_weight * loss_color
+            if use_color and self.color_anchor_weight > 0.0:
+                loss_anchor = self._color_anchor_loss()
+                loss = loss + self.color_anchor_weight * loss_anchor
 
         out_dict: Dict[str, Any] = {
             "loss": loss,
+            "loss_cls": loss_cls,
+            "loss_color": loss_color,
+            "loss_anchor": loss_anchor,
             "logits": logits,
             "logits_bert": logits_bert,
             "logits_gnn": logits_gnn,
@@ -453,6 +499,8 @@ def freeze_gnn_for_warmup(model: EmotionColorGNNBERT) -> None:
     model.set_bert_trainable(True)
     for p in model.color_proj.parameters():
         p.requires_grad = False
+    for p in model.color_head.parameters():
+        p.requires_grad = False
     for p in model.ln_bert.parameters():
         p.requires_grad = False
     for p in model.ln_color.parameters():
@@ -464,12 +512,15 @@ def freeze_gnn_for_warmup(model: EmotionColorGNNBERT) -> None:
     for p in model.gnn_classifier.parameters():
         p.requires_grad = False
     model.residual_scale.requires_grad = False
+    model.label_color_vectors.requires_grad = False
 
 
 def freeze_for_joint(model: EmotionColorGNNBERT) -> None:
     """Freeze BERT + BERT head; train color projection, norms, GCN, classifier."""
     model.set_bert_trainable(False)
     for p in model.color_proj.parameters():
+        p.requires_grad = True
+    for p in model.color_head.parameters():
         p.requires_grad = True
     for p in model.ln_bert.parameters():
         p.requires_grad = True
@@ -1000,14 +1051,16 @@ def run_full_pipeline(
     color_map_path: Optional[str] = None,
     log_jsonl_path: Optional[str] = None,
     metrics_plot_path: Optional[str] = None,
-    # ---- New knobs (items 2–5 of the improvement plan) ----
-    loss_type: str = "asl",
+    # ---- Training / architecture knobs (defaults reflect the refined framework) ----
+    loss_type: str = "bce",
     asl_gamma_pos: float = 0.0,
     asl_gamma_neg: float = 4.0,
     asl_clip: float = 0.05,
-    color_teacher_prob: float = 0.5,
-    adj_temperature: float = 0.25,
-    adj_topk: Optional[int] = 8,
+    color_teacher_prob: float = 0.0,
+    color_loss_weight: float = 0.1,
+    color_anchor_weight: float = 1e-3,
+    adj_temperature: float = 1.0,
+    adj_topk: Optional[int] = None,
     weight_decay: float = 0.01,
     max_grad_norm: float = 1.0,
     warmup_ratio: float = 0.1,
@@ -1018,14 +1071,21 @@ def run_full_pipeline(
     """
     Warm-up BERT head, then joint GNN + color; evaluate BERT-ColorGNN vs BERT-GNN (no color).
 
-    Notable defaults (vs the original pipeline):
-      - ``loss_type='asl'``: asymmetric multi-label loss (better for imbalance).
-      - ``color_teacher_prob=0.5``: during training, half the batch uses ground-truth
-        labels to compute color features so the color branch carries new signal.
-      - ``adj_temperature=0.25`` and ``adj_topk=8``: sharper, sparser batch graph.
-      - Joint phase unfreezes the top ``n_top_bert_layers`` BERT blocks at
-        ``bert_lr_joint`` and uses linear warmup + decay, weight decay, grad clipping,
-        and best-F1 early stopping.
+    Defaults implement the refined framework:
+      - ``loss_type='bce'``: keeps the Bayes-optimal threshold near 0.5 so a fixed
+        0.5 decision threshold stays valid.
+      - ``color_teacher_prob=0.0``: no teacher forcing, so train == eval for the
+        color branch.
+      - ``color_loss_weight=0.1``: auxiliary MSE loss on a ``pooled -> 3D`` head
+        with the ground-truth label-color mixture as target. This is how the color
+        map injects supervision without train/eval mismatch.
+      - ``color_anchor_weight=1e-3``: gentle L2 pull on the trainable color
+        vectors toward the ``COLOR_MAP.txt`` initialization.
+      - ``adj_temperature=1.0`` / ``adj_topk=None``: batch graph defaults reverted;
+        tune via kwargs if desired.
+      - Joint phase still unfreezes the top ``n_top_bert_layers`` BERT blocks at
+        ``bert_lr_joint`` and uses linear warmup + decay, weight decay, grad
+        clipping, and best-F1 early stopping.
 
     If ``metrics_plot_path`` is set (e.g. ``logs/metrics.png``), saves a figure from
     ``metrics_viz`` (requires matplotlib).
@@ -1040,6 +1100,8 @@ def run_full_pipeline(
         "asl_gamma_pos": asl_gamma_pos,
         "asl_gamma_neg": asl_gamma_neg,
         "asl_clip": asl_clip,
+        "color_loss_weight": color_loss_weight,
+        "color_anchor_weight": color_anchor_weight,
     }
 
     model = train_goemotions_warmup(

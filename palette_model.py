@@ -269,6 +269,8 @@ class EmotionColorGNNBERT(nn.Module):
         focal_gamma: float = 2.0,
         color_loss_weight: float = 0.1,
         color_anchor_weight: float = 1e-3,
+        gcn_dropout: float = 0.1,
+        residual_scale_init: float = 0.5,
     ):
         super().__init__()
         self.bert = AutoModel.from_pretrained(bert_name)
@@ -300,12 +302,13 @@ class EmotionColorGNNBERT(nn.Module):
         concat_dim = hidden + 128
         self.gcn1 = nn.Linear(concat_dim, gcn_hidden)
         self.gcn2 = nn.Linear(gcn_hidden, gcn_hidden)
+        self.gnn_dropout = nn.Dropout(gcn_dropout)
         self.gnn_classifier = nn.Linear(gcn_hidden, num_labels)
 
         self.adj_temperature = adj_temperature
         self.adj_topk = adj_topk
         self.use_residual = use_residual
-        self.residual_scale = nn.Parameter(torch.tensor(1.0))
+        self.residual_scale = nn.Parameter(torch.tensor(float(residual_scale_init)))
 
         # Teacher forcing is disabled by default to avoid train/eval mismatch.
         # Kept as an off-by-default option for ablation studies.
@@ -450,8 +453,10 @@ class EmotionColorGNNBERT(nn.Module):
         adj = self._batch_adjacency(pooled.detach())
         h = torch.matmul(adj, x)
         h = F.gelu(self.gcn1(h))
+        h = self.gnn_dropout(h)
         h = torch.matmul(adj, h)
         h = F.gelu(self.gcn2(h))
+        h = self.gnn_dropout(h)
         logits_gnn = self.gnn_classifier(h)
 
         if self.use_residual:
@@ -1046,7 +1051,7 @@ def run_full_pipeline(
     lr_joint: float = 1e-3,
     max_length: int = 128,
     epochs_warmup: int = 3,
-    epochs_joint: int = 3,
+    epochs_joint: int = 5,
     device: Optional[torch.device] = None,
     color_map_path: Optional[str] = None,
     log_jsonl_path: Optional[str] = None,
@@ -1059,6 +1064,8 @@ def run_full_pipeline(
     color_teacher_prob: float = 0.0,
     color_loss_weight: float = 0.1,
     color_anchor_weight: float = 1e-3,
+    gcn_dropout: float = 0.1,
+    residual_scale_init: float = 0.5,
     adj_temperature: float = 1.0,
     adj_topk: Optional[int] = None,
     weight_decay: float = 0.01,
@@ -1102,6 +1109,8 @@ def run_full_pipeline(
         "asl_clip": asl_clip,
         "color_loss_weight": color_loss_weight,
         "color_anchor_weight": color_anchor_weight,
+        "gcn_dropout": gcn_dropout,
+        "residual_scale_init": residual_scale_init,
     }
 
     model = train_goemotions_warmup(

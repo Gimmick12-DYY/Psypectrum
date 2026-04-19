@@ -72,6 +72,8 @@ A plain **BERT pooled + linear** baseline is available as `train_bert_only_basel
 | `color_loss_weight` | `0.1` | Weight on an auxiliary MSE loss: `color_head(pooled) -> 3D` vs the label-averaged color mixture from `COLOR_MAP.txt`. Gives the color map a real supervision signal without train/eval mismatch. |
 | `color_anchor_weight` | `1e-3` | L2 pull on the trainable `label_color_vectors` toward the `COLOR_MAP.txt` initialization. Keeps the hand-designed color geometry while allowing mild refinement. |
 | `color_teacher_prob` | `0.0` | Off by default. If >0, during training each example builds the color vector from ground-truth labels with this probability. Kept for ablation studies. |
+| `gcn_dropout` | `0.1` | Dropout applied after each GCN layer + GELU. Small-model regularizer. |
+| `residual_scale_init` | `0.5` | Initial value of the learnable scalar that weights BERT-head logits in the residual. Lower initial values force the GCN path to earn its share of the final logit. |
 | `adj_temperature` | `1.0` | Temperature on the batch graph softmax. |
 | `adj_topk` | `None` | Optional top-k sparsification of the batch graph. |
 | `n_top_bert_layers` / `bert_lr_joint` | `2 / 2e-5` | Unfreeze the top N BERT transformer blocks during the joint phase with a small LR (discriminative learning rate). |

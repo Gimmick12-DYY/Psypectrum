@@ -12,8 +12,18 @@ from typing import Dict, List, Optional, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 
-METRIC_KEYS: Tuple[str, ...] = ("micro_precision", "micro_recall", "micro_f1")
+METRIC_KEYS: Tuple[str, ...] = (
+    "macro_precision",
+    "macro_recall",
+    "macro_f1",
+    "micro_precision",
+    "micro_recall",
+    "micro_f1",
+)
 METRIC_DISPLAY: Dict[str, str] = {
+    "macro_precision": "Macro precision",
+    "macro_recall": "Macro recall",
+    "macro_f1": "Macro F1",
     "micro_precision": "Micro precision",
     "micro_recall": "Micro recall",
     "micro_f1": "Micro F1",

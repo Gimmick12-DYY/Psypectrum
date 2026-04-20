@@ -641,11 +641,51 @@ def multilabel_f1(
     micro_p = tp / (tp + fp + 1e-8)
     micro_r = tp / (tp + fn + 1e-8)
     micro_f1 = 2 * micro_p * micro_r / (micro_p + micro_r + 1e-8)
+    # Macro metrics: average per-label metrics (equal label weighting).
+    tp_label = (pred * labels).sum(dim=0)
+    fp_label = (pred * (1 - labels)).sum(dim=0)
+    fn_label = ((1 - pred) * labels).sum(dim=0)
+    precision_label = tp_label / (tp_label + fp_label + 1e-8)
+    recall_label = tp_label / (tp_label + fn_label + 1e-8)
+    f1_label = 2 * precision_label * recall_label / (precision_label + recall_label + 1e-8)
+    macro_p = precision_label.mean()
+    macro_r = recall_label.mean()
+    macro_f1 = f1_label.mean()
     return {
+        "macro_precision": float(macro_p.item()),
+        "macro_recall": float(macro_r.item()),
+        "macro_f1": float(macro_f1.item()),
         "micro_precision": float(micro_p.item()),
         "micro_recall": float(micro_r.item()),
         "micro_f1": float(micro_f1.item()),
     }
+
+
+@torch.no_grad()
+def tune_threshold(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    thresholds: Optional[List[float]] = None,
+    objective: str = "micro_f1",
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Sweep decision thresholds on validation logits/labels and return the one
+    that maximizes ``objective`` (default: ``micro_f1``) along with the full
+    metrics dict at that threshold. Lowering the threshold trades precision
+    for recall; tuning picks the per-model sweet spot instead of pinning 0.5.
+    """
+    if thresholds is None:
+        thresholds = [round(0.05 * i, 2) for i in range(2, 13)]  # 0.10..0.60
+    best_t = 0.5
+    best_metrics: Dict[str, float] = multilabel_f1(logits, labels, threshold=best_t)
+    best_score = best_metrics.get(objective, -1.0)
+    for t in thresholds:
+        m = multilabel_f1(logits, labels, threshold=float(t))
+        if m.get(objective, -1.0) > best_score:
+            best_score = m[objective]
+            best_t = float(t)
+            best_metrics = m
+    return best_t, best_metrics
 
 
 # ---------------------------------------------------------------------------
@@ -658,7 +698,7 @@ def train_goemotions_warmup(
     batch_size: int = 16,
     lr: float = 2e-5,
     max_length: int = 128,
-    epochs: int = 3,
+    epochs: int = 4,
     device: Optional[torch.device] = None,
     color_map_path: Optional[str] = None,
     log_jsonl_path: Optional[str] = None,
@@ -815,7 +855,7 @@ def train_goemotions_joint(
     batch_size: int = 16,
     lr: float = 1e-3,
     max_length: int = 128,
-    epochs: int = 3,
+    epochs: int = 4,
     device: Optional[torch.device] = None,
     log_jsonl_path: Optional[str] = None,
     log_every: int = 200,
@@ -871,6 +911,7 @@ def train_goemotions_joint(
     )
 
     best_f1 = -1.0
+    best_threshold = 0.5
     best_state: Optional[Dict[str, torch.Tensor]] = None
 
     for epoch in range(epochs):
@@ -926,20 +967,32 @@ def train_goemotions_joint(
                         out,
                     )
         val_loss /= len(val_loader.dataset)
-        m = multilabel_f1(torch.cat(val_logits), torch.cat(val_labels))
+        logits_cat = torch.cat(val_logits)
+        labels_cat = torch.cat(val_labels)
+        m_default = multilabel_f1(logits_cat, labels_cat, threshold=0.5)
+        best_t, m_tuned = tune_threshold(logits_cat, labels_cat, objective="micro_f1")
         print(
             f"[Joint epoch {epoch + 1}] val loss = {val_loss:.4f} | "
-            f"P={m['micro_precision']:.4f} R={m['micro_recall']:.4f} F1={m['micro_f1']:.4f}"
+            f"t=0.50 P={m_default['micro_precision']:.4f} "
+            f"R={m_default['micro_recall']:.4f} F1={m_default['micro_f1']:.4f} | "
+            f"t*={best_t:.2f} P={m_tuned['micro_precision']:.4f} "
+            f"R={m_tuned['micro_recall']:.4f} F1={m_tuned['micro_f1']:.4f}"
         )
-        if m["micro_f1"] > best_f1:
-            best_f1 = m["micro_f1"]
+        if m_tuned["micro_f1"] > best_f1:
+            best_f1 = m_tuned["micro_f1"]
+            best_threshold = best_t
             if early_stop:
                 best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
     if early_stop and best_state is not None:
-        print(f"[Joint] Restoring best weights (val micro-F1 = {best_f1:.4f})")
+        print(
+            f"[Joint] Restoring best weights (val micro-F1 = {best_f1:.4f} "
+            f"at threshold {best_threshold:.2f})"
+        )
         model.load_state_dict(best_state)
 
+    # Stash the tuned threshold so downstream evaluation can reuse it.
+    model.best_threshold = float(best_threshold)
     return model
 
 
@@ -948,7 +1001,7 @@ def train_bert_only_baseline(
     batch_size: int = 16,
     lr: float = 2e-5,
     max_length: int = 128,
-    epochs: int = 3,
+    epochs: int = 4,
     device: Optional[torch.device] = None,
 ) -> BERTOnlyBaseline:
     """Standalone baseline for evaluation comparison."""
@@ -1009,6 +1062,8 @@ def evaluate_model(
     max_length: int = 128,
     device: Optional[torch.device] = None,
     gnn_branch: str = "full",
+    threshold: Optional[float] = None,
+    tune: bool = False,
 ) -> Dict[str, float]:
     """
     For EmotionColorGNNBERT, gnn_branch selects the forward path:
@@ -1048,7 +1103,15 @@ def evaluate_model(
         all_labels.append(y.cpu())
     logits = torch.cat(all_logits, dim=0)
     labels = torch.cat(all_labels, dim=0)
-    return multilabel_f1(logits, labels)
+    if tune:
+        best_t, metrics = tune_threshold(logits, labels, objective="micro_f1")
+        metrics["threshold"] = best_t
+        return metrics
+    if threshold is None:
+        threshold = float(getattr(model, "best_threshold", 0.5))
+    metrics = multilabel_f1(logits, labels, threshold=threshold)
+    metrics["threshold"] = float(threshold)
+    return metrics
 
 
 def _log_step(
@@ -1104,14 +1167,14 @@ def run_full_pipeline(
     lr_warmup: float = 2e-5,
     lr_joint: float = 1e-3,
     max_length: int = 128,
-    epochs_warmup: int = 3,
-    epochs_joint: int = 5,
+    epochs_warmup: int = 4,
+    epochs_joint: int = 4,
     device: Optional[torch.device] = None,
     color_map_path: Optional[str] = None,
     log_jsonl_path: Optional[str] = None,
     metrics_plot_path: Optional[str] = None,
     # ---- Training / architecture knobs (defaults reflect the refined framework) ----
-    loss_type: str = "bce",
+    loss_type: str = "bce_weighted",
     asl_gamma_pos: float = 0.0,
     asl_gamma_neg: float = 4.0,
     asl_clip: float = 0.05,
@@ -1204,6 +1267,10 @@ def run_full_pipeline(
     )
 
     metrics: Dict[str, Dict[str, float]] = {}
+    # Tune the decision threshold per branch on the validation set; GoEmotions
+    # is negative-dominated so a fixed 0.5 threshold systematically suppresses
+    # recall. ``tune=True`` picks the micro-F1-maximizing threshold (swept from
+    # 0.10 to 0.60 in 0.05 increments).
     metrics["bert_color_gnn"] = evaluate_model(
         model,
         split="validation",
@@ -1212,6 +1279,7 @@ def run_full_pipeline(
         max_length=max_length,
         device=device,
         gnn_branch="full",
+        tune=True,
     )
     metrics["bert_gnn"] = evaluate_model(
         model,
@@ -1221,6 +1289,7 @@ def run_full_pipeline(
         max_length=max_length,
         device=device,
         gnn_branch="bert_gnn",
+        tune=True,
     )
 
     print("Validation metrics:", json.dumps(metrics, indent=2))

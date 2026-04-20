@@ -1,45 +1,38 @@
-# GoEmotions → Hue Mapping
+# GoEmotions → VAD Mapping (NRC-VAD Lexicon v2.1)
+#
+# Valence:   positive/negative sentiment (-1 to +1)
+# Arousal:   activation level, calm vs. excited (-1 to +1)
+# Dominance: sense of control, submissive vs. dominant (-1 to +1)
+#
+# Source: Mohammad (2018), NRC Valence, Arousal, and Dominance Lexicon v2.1
 
-This repository uses a color palette for GoEmotions where warmer hues correspond to more positive valence and colder hues correspond to more negative valence. Hues are assigned deterministically from a heuristic valence score in \[-1, 1].
-
-Mapping formula:
-- Warm anchor (positive): `POS_HUE_DEG = 40°` (orange-ish)
-- Cold anchor (negative): `NEG_HUE_DEG = 220°` (blue-ish)
-- Given valence `v` in \[-1, 1], hue is `h = POS_HUE_DEG + (NEG_HUE_DEG - POS_HUE_DEG) * ((1 - v) / 2)`
-
-Label table (degrees):
-
-| Label          | Valence | Hue (deg) |
-| -------------- | ------- | --------- |
-| admiration     | 0.7     | 67.0      |
-| amusement      | 0.7     | 67.0      |
-| anger          | -0.8    | 202.0     |
-| annoyance      | -0.6    | 184.0     |
-| approval       | 0.6     | 76.0      |
-| caring         | 0.5     | 85.0      |
-| confusion      | -0.2    | 148.0     |
-| curiosity      | 0.2     | 112.0     |
-| desire         | 0.3     | 103.0     |
-| disappointment | -0.7    | 193.0     |
-| disapproval    | -0.6    | 184.0     |
-| disgust        | -0.8    | 202.0     |
-| embarrassment  | -0.5    | 175.0     |
-| excitement     | 0.8     | 58.0      |
-| fear           | -0.9    | 211.0     |
-| gratitude      | 0.8     | 58.0      |
-| grief          | -0.9    | 211.0     |
-| joy            | 1.0     | 40.0      |
-| love           | 1.0     | 40.0      |
-| nervousness    | -0.5    | 175.0     |
-| optimism       | 0.8     | 58.0      |
-| pride          | 0.6     | 76.0      |
-| realization    | 0.1     | 121.0     |
-| relief         | 0.5     | 85.0      |
-| remorse        | -0.7    | 193.0     |
-| sadness        | -0.8    | 202.0     |
-| surprise       | 0.0     | 130.0     |
-| neutral        | 0.0     | 130.0     |
-
-Notes:
-- The mapping is linear in valence; you can adjust `POS_HUE_DEG`, `NEG_HUE_DEG`, or per-label valence to reshape the palette.
-- We will convert these hues to unit vectors (sin, cos) in the model to avoid wrap-around discontinuities.
+| Label          | Valence | Arousal | Dominance |
+| -------------- | ------- | ------- | --------- |
+| admiration     |  0.938  |  0.166  |  0.452    |
+| amusement      |  0.858  |  0.674  |  0.606    |
+| anger          | -0.666  |  0.730  |  0.314    |
+| annoyance      | -0.666  |  0.436  | -0.316    |
+| approval       |  0.708  | -0.080  |  0.778    |
+| caring         |  0.270  | -0.062  |  0.000    |
+| confusion      | -0.490  |  0.334  | -0.446    |
+| curiosity      |  0.500  |  0.510  | -0.074    |
+| desire         |  0.792  |  0.384  |  0.294    |
+| disappointment | -0.770  | -0.020  | -0.328    |
+| disapproval    | -0.830  |  0.102  | -0.266    |
+| disgust        | -0.896  |  0.550  | -0.366    |
+| embarrassment  | -0.714  |  0.370  | -0.548    |
+| excitement     |  0.792  |  0.368  |  0.462    |
+| fear           | -0.854  |  0.680  | -0.414    |
+| gratitude      |  0.770  | -0.118  |  0.220    |
+| grief          | -0.860  |  0.280  | -0.052    |
+| joy            |  0.960  |  0.648  |  0.588    |
+| love           |  0.996  |  0.334  |  0.234    |
+| nervousness    | -0.674  |  0.830  | -0.518    |
+| neutral        | -0.062  | -0.632  | -0.286    |
+| optimism       |  0.898  |  0.130  |  0.628    |
+| pride          |  0.458  |  0.268  |  0.696    |
+| realization    |  0.108  |  0.020  |  0.672    |
+| relief         |  0.688  | -0.444  | -0.038    |
+| remorse        | -0.794  |  0.346  | -0.246    |
+| sadness        | -0.896  | -0.424  | -0.672    |
+| surprise       |  0.750  |  0.750  |  0.124    |

@@ -67,15 +67,15 @@ LABEL_TO_INDEX = {name: i for i, name in enumerate(GOEMOTIONS_LABELS)}
 # ---------------------------------------------------------------------------
 
 _ROW_RE = re.compile(
-    r"^\|\s*([a-z_]+)\s*\|\s*([-0-9.]+)\s*\|\s*([-0-9.]+)\s*\|\s*$",
+    r"^\|\s*([a-z_]+)\s*\|\s*([-0-9.]+)\s*\|\s*([-0-9.]+)\s*\|\s*([-0-9.]+)\s*\|\s*$",
     re.IGNORECASE,
 )
 
 
 def load_color_map(path: str) -> Dict[str, Dict[str, float]]:
     """
-    Parse the markdown table in COLOR_MAP.txt into label -> {valence, hue_deg}.
-    Saturation is not stored in the table: neutral -> 0, all other labels -> 1.0.
+    Parse the markdown table in COLOR_MAP.txt into label -> {valence, arousal, dominance}.
+    Values sourced from NRC-VAD Lexicon v2.1 (Mohammad, 2018).
     """
     out: Dict[str, Dict[str, float]] = {}
     with open(path, "r", encoding="utf-8") as f:
@@ -85,9 +85,10 @@ def load_color_map(path: str) -> Dict[str, Dict[str, float]]:
             if not m:
                 continue
             label = m.group(1).lower()
-            valence = float(m.group(2))
-            hue_deg = float(m.group(3))
-            out[label] = {"valence": valence, "hue_deg": hue_deg}
+            valence   = float(m.group(2))
+            arousal   = float(m.group(3))
+            dominance = float(m.group(4))
+            out[label] = {"valence": valence, "arousal": arousal, "dominance": dominance}
 
     missing = [l for l in GOEMOTIONS_LABELS if l not in out]
     if missing:
@@ -97,21 +98,17 @@ def load_color_map(path: str) -> Dict[str, Dict[str, float]]:
 
 def _label_color_table(color_map: Dict[str, Dict[str, float]]) -> torch.Tensor:
     """
-    Per-label 3D vectors [sat*cos(h), sat*sin(h), valence] with hue in radians.
-    Neutral: saturation 0 (origin in hue plane). Others: saturation 1.0.
-    Surprise vs neutral at same hue: valence/saturation distinguish (neutral sat=0).
+    Per-label 3D vectors [valence, arousal, dominance] from NRC-VAD Lexicon.
+    All three dimensions are independent, giving each emotion a unique position
+    in the VAD space (resolves the hue-based collapse where anger/sadness/disgust
+    shared identical coordinates).
     """
     rows = []
     for label in GOEMOTIONS_LABELS:
         v = color_map[label]["valence"]
-        h_deg = color_map[label]["hue_deg"]
-        sat = 0.0 if label == "neutral" else 1.0
-        h_rad = torch.deg2rad(torch.tensor(h_deg, dtype=torch.float32))
-        cos_h = torch.cos(h_rad)
-        sin_h = torch.sin(h_rad)
-        x = sat * cos_h
-        y = sat * sin_h
-        rows.append(torch.stack([x, y, torch.tensor(v, dtype=torch.float32)]))
+        a = color_map[label]["arousal"]
+        d = color_map[label]["dominance"]
+        rows.append(torch.tensor([v, a, d], dtype=torch.float32))
     return torch.stack(rows, dim=0)  # [28, 3]
 
 

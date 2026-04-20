@@ -56,7 +56,9 @@ model, metrics = run_full_pipeline(
 | Key | Meaning |
 | --- | --- |
 | `bert_color_gnn` | Full model: BERT embeddings + color features, GCN, residual. |
-| `bert_gnn` | Same GCN and residual, but **no** color module: the 128-dimensional color slot is zero so only the BERT half of the first GCN input carries signal (same checkpoint, fair comparison to isolating the color branch). |
+| `bert_gnn` | Same GCN and residual, but **no** color module: the 128-dimensional color slot is zero **and** the color-similarity logit bias is disabled, so only the BERT/GCN pathway carries signal (same checkpoint, fair comparison that isolates the color contribution). |
+
+Why two color pathways? Injecting the mixed color vector into the GCN concat alone is near-redundant with BERT (the mixture is a deterministic function of BERT logits), so the ablation gap tended to collapse. The second pathway — a small learned color classifier `color_to_label(color_head(pooled))` added to each label logit with a trainable scale — gives the color module a **direct** classifier signal that the GCN/BERT path cannot replicate, and it vanishes cleanly under `use_color=False`. It is trained only through the main BCE (no separate discriminative BCE on the color-only logits, which we found creates calibration coupling between `logits_main` and `color_bias` and breaks the ablation).
 
 For programmatic evaluation with other splits or branches, use `evaluate_model(..., gnn_branch=...)`. Supported values include `full`, `bert_gnn` / `gnn_no_color`, and `bert_only` (BERT head only, no GNN).
 
@@ -69,11 +71,12 @@ A plain **BERT pooled + linear** baseline is available as `train_bert_only_basel
 | Knob | Default | What it does |
 | --- | --- | --- |
 | `loss_type` | `"bce"` | Binary cross-entropy. Also supports `"bce_weighted"` (auto pos_weight, clipped), `"asl"` (asymmetric multi-label loss), and `"focal"`. |
-| `color_loss_weight` | `0.1` | Weight on an auxiliary MSE loss: `color_head(pooled) -> 3D` vs the label-averaged color mixture from `COLOR_MAP.txt`. Gives the color map a real supervision signal without train/eval mismatch. |
+| `color_loss_weight` | `0.1` | Weight on an auxiliary MSE loss: `color_head(pooled) -> 3D` vs the label-averaged color mixture from `COLOR_MAP.txt`. Anchors the 3-D bottleneck to interpretable color coordinates without over-pulling it from the main classification objective. |
 | `color_anchor_weight` | `1e-3` | L2 pull on the trainable `label_color_vectors` toward the `COLOR_MAP.txt` initialization. Keeps the hand-designed color geometry while allowing mild refinement. |
 | `color_teacher_prob` | `0.0` | Off by default. If >0, during training each example builds the color vector from ground-truth labels with this probability. Kept for ablation studies. |
 | `gcn_dropout` | `0.1` | Dropout applied after each GCN layer + GELU. Small-model regularizer. |
 | `residual_scale_init` | `0.5` | Initial value of the learnable scalar that weights BERT-head logits in the residual. Lower initial values force the GCN path to earn its share of the final logit. |
+| `color_logit_scale_init` | `0.5` | Initial value of the learnable scalar that weights the color-only logit-bias pathway. Lower init prevents the color head from aggressively trading precision for recall early in training; it is still trainable. |
 | `adj_temperature` | `1.0` | Temperature on the batch graph softmax. |
 | `adj_topk` | `None` | Optional top-k sparsification of the batch graph. |
 | `n_top_bert_layers` / `bert_lr_joint` | `2 / 2e-5` | Unfreeze the top N BERT transformer blocks during the joint phase with a small LR (discriminative learning rate). |

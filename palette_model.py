@@ -271,6 +271,7 @@ class EmotionColorGNNBERT(nn.Module):
         color_anchor_weight: float = 1e-3,
         gcn_dropout: float = 0.1,
         residual_scale_init: float = 0.5,
+        color_logit_scale_init: float = 0.5,
     ):
         super().__init__()
         self.bert = AutoModel.from_pretrained(bert_name)
@@ -299,6 +300,19 @@ class EmotionColorGNNBERT(nn.Module):
         self.color_loss_weight = color_loss_weight
         self.color_anchor_weight = color_anchor_weight
 
+        # Direct color -> label classifier head (3 -> num_labels). Initialized so
+        # its initial behavior is a dot product against the color map (same
+        # geometry as a cosine-similarity bias, but each label has its own
+        # free weights so it can refine its effective color direction).
+        # Trained implicitly through the main BCE via the +scale*color_bias
+        # addition to the logits; no separate discriminative BCE (that created
+        # calibration coupling between logits_main and color_bias and broke
+        # the bert_gnn ablation).
+        self.color_to_label = nn.Linear(3, num_labels, bias=True)
+        with torch.no_grad():
+            self.color_to_label.weight.copy_(table)
+            self.color_to_label.bias.zero_()
+
         concat_dim = hidden + 128
         self.gcn1 = nn.Linear(concat_dim, gcn_hidden)
         self.gcn2 = nn.Linear(gcn_hidden, gcn_hidden)
@@ -309,6 +323,13 @@ class EmotionColorGNNBERT(nn.Module):
         self.adj_topk = adj_topk
         self.use_residual = use_residual
         self.residual_scale = nn.Parameter(torch.tensor(float(residual_scale_init)))
+
+        # Learnable scale on the color logit-bias pathway (applied only when
+        # ``use_color`` is true). Gives the color module a direct, non-redundant
+        # classifier pathway: logit_ell += scale * color_to_label(color_head(pooled))_ell.
+        # Initialized modestly (0.5) so the pathway opens up gradually rather
+        # than aggressively trading precision for recall.
+        self.color_logit_scale = nn.Parameter(torch.tensor(float(color_logit_scale_init)))
 
         # Teacher forcing is disabled by default to avoid train/eval mismatch.
         # Kept as an off-by-default option for ablation studies.
@@ -399,6 +420,7 @@ class EmotionColorGNNBERT(nn.Module):
         self,
         pooled: torch.Tensor,
         labels: torch.Tensor,
+        pred_color: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Auxiliary color reconstruction: predict the label-averaged color vector
@@ -408,11 +430,25 @@ class EmotionColorGNNBERT(nn.Module):
         """
         mass = labels.sum(dim=-1, keepdim=True).clamp(min=1.0)
         target = (labels @ self.label_color_vectors_init) / mass
-        pred = self.color_head(pooled)
-        return F.mse_loss(pred, target)
+        if pred_color is None:
+            pred_color = self.color_head(pooled)
+        return F.mse_loss(pred_color, target)
 
     def _color_anchor_loss(self) -> torch.Tensor:
         return F.mse_loss(self.label_color_vectors, self.label_color_vectors_init)
+
+    def _color_logit_bias(self, pred_color: torch.Tensor) -> torch.Tensor:
+        """
+        Direct color -> label pathway: a small learned linear head maps the
+        predicted 3-D sentence color to per-label logits. The head is
+        initialized from ``label_color_vectors`` so its initial behavior is a
+        dot product against the color map (same geometry as a cosine-similarity
+        bias), but with free per-label weights it can refine each label's
+        effective color direction. Added to the final logits with a learnable
+        scale when ``use_color=True``; this is the component ablated by the
+        ``bert_gnn`` branch.
+        """
+        return self.color_to_label(pred_color)
 
     def forward(
         self,
@@ -437,11 +473,13 @@ class EmotionColorGNNBERT(nn.Module):
             }
 
         x_b = self.ln_bert(pooled)
+        pred_color: Optional[torch.Tensor] = None
         if use_color:
             e_vec = self._emotion_vectors(logits_bert, labels=labels)
             c = self.color_proj(e_vec)
             x_c = self.ln_color(c)
             x = torch.cat([x_b, x_c], dim=-1)
+            pred_color = self.color_head(pooled)
         else:
             # Same 896-dim layout as full model: BERT half + zeros (no color module).
             e_vec = None
@@ -464,6 +502,12 @@ class EmotionColorGNNBERT(nn.Module):
         else:
             logits = logits_gnn
 
+        # Direct color -> label pathway: only active when the color module is in use.
+        color_bias: Optional[torch.Tensor] = None
+        if use_color and pred_color is not None:
+            color_bias = self._color_logit_bias(pred_color)
+            logits = logits + self.color_logit_scale * color_bias
+
         loss = None
         loss_cls = None
         loss_color = None
@@ -472,7 +516,7 @@ class EmotionColorGNNBERT(nn.Module):
             loss_cls = self._loss(logits, labels)
             loss = loss_cls
             if use_color and self.color_loss_weight > 0.0:
-                loss_color = self._color_aux_loss(pooled, labels)
+                loss_color = self._color_aux_loss(pooled, labels, pred_color=pred_color)
                 loss = loss + self.color_loss_weight * loss_color
             if use_color and self.color_anchor_weight > 0.0:
                 loss_anchor = self._color_anchor_loss()
@@ -490,6 +534,10 @@ class EmotionColorGNNBERT(nn.Module):
         }
         if e_vec is not None:
             out_dict["emotion_vectors"] = e_vec
+        if pred_color is not None:
+            out_dict["pred_color"] = pred_color
+        if color_bias is not None:
+            out_dict["color_bias"] = color_bias
         return out_dict
 
     def set_bert_trainable(self, trainable: bool) -> None:
@@ -506,6 +554,8 @@ def freeze_gnn_for_warmup(model: EmotionColorGNNBERT) -> None:
         p.requires_grad = False
     for p in model.color_head.parameters():
         p.requires_grad = False
+    for p in model.color_to_label.parameters():
+        p.requires_grad = False
     for p in model.ln_bert.parameters():
         p.requires_grad = False
     for p in model.ln_color.parameters():
@@ -517,6 +567,7 @@ def freeze_gnn_for_warmup(model: EmotionColorGNNBERT) -> None:
     for p in model.gnn_classifier.parameters():
         p.requires_grad = False
     model.residual_scale.requires_grad = False
+    model.color_logit_scale.requires_grad = False
     model.label_color_vectors.requires_grad = False
 
 
@@ -526,6 +577,8 @@ def freeze_for_joint(model: EmotionColorGNNBERT) -> None:
     for p in model.color_proj.parameters():
         p.requires_grad = True
     for p in model.color_head.parameters():
+        p.requires_grad = True
+    for p in model.color_to_label.parameters():
         p.requires_grad = True
     for p in model.ln_bert.parameters():
         p.requires_grad = True
@@ -538,6 +591,7 @@ def freeze_for_joint(model: EmotionColorGNNBERT) -> None:
     for p in model.gnn_classifier.parameters():
         p.requires_grad = True
     model.residual_scale.requires_grad = True
+    model.color_logit_scale.requires_grad = True
     model.label_color_vectors.requires_grad = True
 
 
@@ -1064,6 +1118,7 @@ def run_full_pipeline(
     color_teacher_prob: float = 0.0,
     color_loss_weight: float = 0.1,
     color_anchor_weight: float = 1e-3,
+    color_logit_scale_init: float = 0.5,
     gcn_dropout: float = 0.1,
     residual_scale_init: float = 0.5,
     adj_temperature: float = 1.0,
@@ -1088,6 +1143,9 @@ def run_full_pipeline(
         map injects supervision without train/eval mismatch.
       - ``color_anchor_weight=1e-3``: gentle L2 pull on the trainable color
         vectors toward the ``COLOR_MAP.txt`` initialization.
+      - ``color_logit_scale_init=0.5``: modest initial weight on the color
+        logit-bias term so the color pathway opens gradually. The scale is a
+        trainable scalar, so the model can grow it if the color path is useful.
       - ``adj_temperature=1.0`` / ``adj_topk=None``: batch graph defaults reverted;
         tune via kwargs if desired.
       - Joint phase still unfreezes the top ``n_top_bert_layers`` BERT blocks at
@@ -1109,6 +1167,7 @@ def run_full_pipeline(
         "asl_clip": asl_clip,
         "color_loss_weight": color_loss_weight,
         "color_anchor_weight": color_anchor_weight,
+        "color_logit_scale_init": color_logit_scale_init,
         "gcn_dropout": gcn_dropout,
         "residual_scale_init": residual_scale_init,
     }

@@ -22,6 +22,12 @@ from torch.utils.data import DataLoader, Dataset
 from datasets import load_dataset
 from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warmup
 
+from model_extensions import (
+    LabelGraphGCN,
+    TokenVADEncoder,
+    supervised_contrastive_loss,
+)
+
 
 # ---------------------------------------------------------------------------
 # 0. GoEmotions label order (28 labels)
@@ -269,69 +275,128 @@ class EmotionColorGNNBERT(nn.Module):
         gcn_dropout: float = 0.1,
         residual_scale_init: float = 0.5,
         color_logit_scale_init: float = 0.5,
+        # ---- New experiment flags ----
+        disable_color: bool = False,
+        use_logit_mix_vad: bool = True,
+        use_token_vad: bool = False,
+        token_vad_table: Optional[torch.Tensor] = None,
+        gcn_type: str = "batch",
+        gcn_n_layers: int = 2,
+        gcn_internal_residual: bool = False,
+        label_graph_adj: Optional[torch.Tensor] = None,
+        label_graph_init: Optional[torch.Tensor] = None,
+        label_graph_hidden: int = 512,
+        label_graph_out: int = 512,
+        supcon_weight: float = 0.0,
+        supcon_temperature: float = 0.1,
     ):
         super().__init__()
         self.bert = AutoModel.from_pretrained(bert_name)
         hidden = self.bert.config.hidden_size
         self.bert_head = nn.Linear(hidden, num_labels)
 
+        # ---- Color flags ----
+        self.disable_color = bool(disable_color)
+        self.use_logit_mix_vad = bool(use_logit_mix_vad) and not self.disable_color
+        self.use_token_vad = bool(use_token_vad) and not self.disable_color
+        self.color_loss_weight = float(color_loss_weight)
+        self.color_anchor_weight = float(color_anchor_weight)
+        self.supcon_weight = float(supcon_weight)
+        self.supcon_temperature = float(supcon_temperature)
+
         cmap = load_color_map(color_map_path or default_color_map_path())
-        table = _label_color_table(cmap)
-        # Trainable label color embeddings (initialized from COLOR_MAP); anchored
-        # to the hand-designed geometry via ``color_anchor_weight`` so they can
-        # refine but not drift.
-        self.label_color_vectors = nn.Parameter(table.clone())
+        table = _label_color_table(cmap)  # always parsed (used as label-graph init too)
         self.register_buffer("label_color_vectors_init", table.clone())
 
         self.ln_bert = nn.LayerNorm(hidden)
-        self.color_proj = nn.Sequential(
-            nn.Linear(3, 128),
-            nn.GELU(),
-        )
-        self.ln_color = nn.LayerNorm(128)
 
-        # Auxiliary head: predict the label-averaged color coordinate from pooled
-        # BERT. Targets use ground-truth labels only during training; eval never
-        # uses labels (no train/eval mismatch).
-        self.color_head = nn.Linear(hidden, 3)
-        self.color_loss_weight = color_loss_weight
-        self.color_anchor_weight = color_anchor_weight
+        # Color modules: only built when not disabled. When disable_color=True the
+        # network has zero color parameters (honest no-color training).
+        if not self.disable_color:
+            self.label_color_vectors = nn.Parameter(table.clone())
 
-        # Direct color -> label classifier head (3 -> num_labels). Initialized so
-        # its initial behavior is a dot product against the color map (same
-        # geometry as a cosine-similarity bias, but each label has its own
-        # free weights so it can refine its effective color direction).
-        # Trained implicitly through the main BCE via the +scale*color_bias
-        # addition to the logits; no separate discriminative BCE (that created
-        # calibration coupling between logits_main and color_bias and broke
-        # the bert_gnn ablation).
-        self.color_to_label = nn.Linear(3, num_labels, bias=True)
-        with torch.no_grad():
-            self.color_to_label.weight.copy_(table)
-            self.color_to_label.bias.zero_()
+            color_in_dim = 0
+            if self.use_logit_mix_vad:
+                color_in_dim += 3
+            if self.use_token_vad:
+                if token_vad_table is None:
+                    raise ValueError(
+                        "use_token_vad=True requires token_vad_table (precomputed [V,3])"
+                    )
+                self.token_vad = TokenVADEncoder(token_vad_table)
+                color_in_dim += 6  # mean(3) + max(3)
+            if color_in_dim == 0:
+                raise ValueError(
+                    "Color enabled but no source selected: set use_logit_mix_vad=True "
+                    "and/or use_token_vad=True, or pass disable_color=True."
+                )
+            self.color_in_dim = color_in_dim
+            self.color_proj = nn.Sequential(
+                nn.Linear(color_in_dim, 128),
+                nn.GELU(),
+            )
+            self.ln_color = nn.LayerNorm(128)
 
-        concat_dim = hidden + 128
-        self.gcn1 = nn.Linear(concat_dim, gcn_hidden)
-        self.gcn2 = nn.Linear(gcn_hidden, gcn_hidden)
-        self.gnn_dropout = nn.Dropout(gcn_dropout)
-        self.gnn_classifier = nn.Linear(gcn_hidden, num_labels)
+            # color_head: pooled -> 3D (used by aux MSE, color->label bias, supcon).
+            self.color_head = nn.Linear(hidden, 3)
 
-        self.adj_temperature = adj_temperature
+            # Direct color -> label classifier (3 -> num_labels), initialized as the
+            # dot-product against the per-label VAD vectors.
+            self.color_to_label = nn.Linear(3, num_labels, bias=True)
+            with torch.no_grad():
+                self.color_to_label.weight.copy_(table)
+                self.color_to_label.bias.zero_()
+
+            self.color_logit_scale = nn.Parameter(torch.tensor(float(color_logit_scale_init)))
+        else:
+            self.color_in_dim = 0
+
+        # ---- GCN type ----
+        self.gcn_type = str(gcn_type)
+        if self.gcn_type not in ("batch", "label"):
+            raise ValueError(f"gcn_type must be 'batch' or 'label', got {gcn_type!r}")
+        self.gcn_n_layers = int(gcn_n_layers)
+        self.gcn_internal_residual = bool(gcn_internal_residual)
+
+        # Concat dim for the per-example feature: BERT pooled + (optional) color slot.
+        # When color is disabled, we use just the 768-dim normalized BERT feature.
+        if self.disable_color:
+            concat_dim = hidden
+        else:
+            concat_dim = hidden + 128
+
+        if self.gcn_type == "batch":
+            # Standard batch-graph GCN on per-example features.
+            self.gcn1 = nn.Linear(concat_dim, gcn_hidden)
+            if self.gcn_n_layers >= 2:
+                self.gcn2 = nn.Linear(gcn_hidden, gcn_hidden)
+            self.gnn_dropout = nn.Dropout(gcn_dropout)
+            self.gnn_classifier = nn.Linear(gcn_hidden, num_labels)
+        elif self.gcn_type == "label":
+            # ML-GCN style label-graph: label embeddings propagate over label adjacency,
+            # output per-label classifier weight vectors, dot with example features.
+            if label_graph_adj is None or label_graph_init is None:
+                raise ValueError(
+                    "gcn_type='label' requires label_graph_adj and label_graph_init"
+                )
+            self.feat_proj = nn.Linear(concat_dim, label_graph_out)
+            self.label_graph = LabelGraphGCN(
+                label_init=label_graph_init,
+                adj=label_graph_adj,
+                hidden_dim=label_graph_hidden,
+                out_dim=label_graph_out,
+            )
+            self.gnn_dropout = nn.Dropout(gcn_dropout)
+
+        self.adj_temperature = float(adj_temperature)
         self.adj_topk = adj_topk
-        self.use_residual = use_residual
+        self.use_residual = bool(use_residual)
         self.residual_scale = nn.Parameter(torch.tensor(float(residual_scale_init)))
 
-        # Learnable scale on the color logit-bias pathway (applied only when
-        # ``use_color`` is true). Gives the color module a direct, non-redundant
-        # classifier pathway: logit_ell += scale * color_to_label(color_head(pooled))_ell.
-        # Initialized modestly (0.5) so the pathway opens up gradually rather
-        # than aggressively trading precision for recall.
-        self.color_logit_scale = nn.Parameter(torch.tensor(float(color_logit_scale_init)))
+        # Teacher forcing for the color mix (off by default).
+        self.color_teacher_prob = float(color_teacher_prob)
 
-        # Teacher forcing is disabled by default to avoid train/eval mismatch.
-        # Kept as an off-by-default option for ablation studies.
-        self.color_teacher_prob = color_teacher_prob
-
+        # ---- Loss ----
         self.loss_type = loss_type
         if loss_type == "bce":
             self._loss = nn.BCEWithLogitsLoss()
@@ -349,7 +414,6 @@ class EmotionColorGNNBERT(nn.Module):
                 clip=asl_clip,
             )
         elif loss_type == "focal":
-            # Focal is a special case of ASL with symmetric gammas and no clip.
             self._loss = AsymmetricLoss(
                 gamma_pos=focal_gamma,
                 gamma_neg=focal_gamma,
@@ -447,6 +511,21 @@ class EmotionColorGNNBERT(nn.Module):
         """
         return self.color_to_label(pred_color)
 
+    def _color_features(
+        self,
+        logits_bert: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Concatenate the enabled color sources into a [B, color_in_dim] tensor."""
+        pieces: List[torch.Tensor] = []
+        if self.use_logit_mix_vad:
+            pieces.append(self._emotion_vectors(logits_bert, labels=labels))  # [B, 3]
+        if self.use_token_vad:
+            pieces.append(self.token_vad(input_ids, attention_mask))  # [B, 6]
+        return torch.cat(pieces, dim=-1)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -469,39 +548,63 @@ class EmotionColorGNNBERT(nn.Module):
                 "pooled": pooled,
             }
 
+        # Effective color flag: forced off if model has no color modules.
+        use_color_now = bool(use_color) and not self.disable_color
+
         x_b = self.ln_bert(pooled)
         pred_color: Optional[torch.Tensor] = None
-        if use_color:
-            e_vec = self._emotion_vectors(logits_bert, labels=labels)
-            c = self.color_proj(e_vec)
+        e_vec: Optional[torch.Tensor] = None
+        color_feats: Optional[torch.Tensor] = None
+        if use_color_now:
+            color_feats = self._color_features(logits_bert, input_ids, attention_mask, labels)
+            if self.use_logit_mix_vad:
+                e_vec = color_feats[:, :3]  # for logging
+            c = self.color_proj(color_feats)
             x_c = self.ln_color(c)
             x = torch.cat([x_b, x_c], dim=-1)
             pred_color = self.color_head(pooled)
         else:
-            # Same 896-dim layout as full model: BERT half + zeros (no color module).
-            e_vec = None
-            x = torch.cat(
-                [x_b, pooled.new_zeros(pooled.size(0), 128)],
-                dim=-1,
-            )
+            # Build x WITHOUT a color slot.
+            # - If the model has color modules (forward-time ablation only), keep
+            #   the 896-dim layout by zero-padding so existing batch-graph weights stay valid.
+            # - If the model has no color modules at all (disable_color=True), x is 768-dim
+            #   and gcn1 was constructed with input_dim=768 to match.
+            if self.disable_color:
+                x = x_b
+            else:
+                x = torch.cat([x_b, pooled.new_zeros(pooled.size(0), 128)], dim=-1)
 
-        adj = self._batch_adjacency(pooled.detach())
-        h = torch.matmul(adj, x)
-        h = F.gelu(self.gcn1(h))
-        h = self.gnn_dropout(h)
-        h = torch.matmul(adj, h)
-        h = F.gelu(self.gcn2(h))
-        h = self.gnn_dropout(h)
-        logits_gnn = self.gnn_classifier(h)
+        # ---- GCN ----
+        if self.gcn_type == "batch":
+            adj = self._batch_adjacency(pooled.detach())
+            h = torch.matmul(adj, x)
+            h = F.gelu(self.gcn1(h))
+            h = self.gnn_dropout(h)
+            if self.gcn_n_layers >= 2:
+                if self.gcn_internal_residual:
+                    h_in = h
+                    h = torch.matmul(adj, h)
+                    h = F.gelu(self.gcn2(h))
+                    h = self.gnn_dropout(h)
+                    h = h + h_in
+                else:
+                    h = torch.matmul(adj, h)
+                    h = F.gelu(self.gcn2(h))
+                    h = self.gnn_dropout(h)
+            logits_gnn = self.gnn_classifier(h)
+        else:  # 'label'
+            feat = self.feat_proj(x)
+            feat = self.gnn_dropout(feat)
+            W = self.label_graph()  # [C, out_dim]
+            logits_gnn = feat @ W.t()
 
         if self.use_residual:
             logits = logits_gnn + self.residual_scale * logits_bert
         else:
             logits = logits_gnn
 
-        # Direct color -> label pathway: only active when the color module is in use.
         color_bias: Optional[torch.Tensor] = None
-        if use_color and pred_color is not None:
+        if use_color_now and pred_color is not None:
             color_bias = self._color_logit_bias(pred_color)
             logits = logits + self.color_logit_scale * color_bias
 
@@ -509,21 +612,28 @@ class EmotionColorGNNBERT(nn.Module):
         loss_cls = None
         loss_color = None
         loss_anchor = None
+        loss_supcon = None
         if labels is not None:
             loss_cls = self._loss(logits, labels)
             loss = loss_cls
-            if use_color and self.color_loss_weight > 0.0:
+            if use_color_now and self.color_loss_weight > 0.0:
                 loss_color = self._color_aux_loss(pooled, labels, pred_color=pred_color)
                 loss = loss + self.color_loss_weight * loss_color
-            if use_color and self.color_anchor_weight > 0.0:
+            if use_color_now and self.color_anchor_weight > 0.0 and hasattr(self, "label_color_vectors"):
                 loss_anchor = self._color_anchor_loss()
                 loss = loss + self.color_anchor_weight * loss_anchor
+            if use_color_now and self.supcon_weight > 0.0 and pred_color is not None:
+                loss_supcon = supervised_contrastive_loss(
+                    pred_color, labels, temperature=self.supcon_temperature
+                )
+                loss = loss + self.supcon_weight * loss_supcon
 
         out_dict: Dict[str, Any] = {
             "loss": loss,
             "loss_cls": loss_cls,
             "loss_color": loss_color,
             "loss_anchor": loss_anchor,
+            "loss_supcon": loss_supcon,
             "logits": logits,
             "logits_bert": logits_bert,
             "logits_gnn": logits_gnn,
@@ -544,52 +654,58 @@ class EmotionColorGNNBERT(nn.Module):
             p.requires_grad = trainable
 
 
+def _set_module_trainable(model: EmotionColorGNNBERT, names: List[str], trainable: bool) -> None:
+    """Set requires_grad on every parameter of every named submodule that exists on model."""
+    for name in names:
+        mod = getattr(model, name, None)
+        if mod is None:
+            continue
+        if isinstance(mod, nn.Parameter):
+            mod.requires_grad = trainable
+        else:
+            for p in mod.parameters():
+                p.requires_grad = trainable
+
+
+# Names of every potential color / GCN / classifier submodule on EmotionColorGNNBERT.
+# Robust to missing modules (label-graph mode lacks gcn1/gcn2, no-color mode lacks color_*).
+_COLOR_GCN_MODULES = [
+    "color_proj",
+    "color_head",
+    "color_to_label",
+    "ln_bert",
+    "ln_color",
+    "gcn1",
+    "gcn2",
+    "gnn_classifier",
+    "feat_proj",
+    "label_graph",
+]
+_COLOR_GCN_PARAMS = [
+    "residual_scale",
+    "color_logit_scale",
+    "label_color_vectors",
+]
+
+
 def freeze_gnn_for_warmup(model: EmotionColorGNNBERT) -> None:
     """Train only BERT + bert_head; hold color/GNN parameters fixed."""
     model.set_bert_trainable(True)
-    for p in model.color_proj.parameters():
-        p.requires_grad = False
-    for p in model.color_head.parameters():
-        p.requires_grad = False
-    for p in model.color_to_label.parameters():
-        p.requires_grad = False
-    for p in model.ln_bert.parameters():
-        p.requires_grad = False
-    for p in model.ln_color.parameters():
-        p.requires_grad = False
-    for p in model.gcn1.parameters():
-        p.requires_grad = False
-    for p in model.gcn2.parameters():
-        p.requires_grad = False
-    for p in model.gnn_classifier.parameters():
-        p.requires_grad = False
-    model.residual_scale.requires_grad = False
-    model.color_logit_scale.requires_grad = False
-    model.label_color_vectors.requires_grad = False
+    _set_module_trainable(model, _COLOR_GCN_MODULES, False)
+    for name in _COLOR_GCN_PARAMS:
+        p = getattr(model, name, None)
+        if isinstance(p, nn.Parameter):
+            p.requires_grad = False
 
 
 def freeze_for_joint(model: EmotionColorGNNBERT) -> None:
-    """Freeze BERT + BERT head; train color projection, norms, GCN, classifier."""
+    """Freeze BERT body + BERT head; train color projection, norms, GCN, classifier."""
     model.set_bert_trainable(False)
-    for p in model.color_proj.parameters():
-        p.requires_grad = True
-    for p in model.color_head.parameters():
-        p.requires_grad = True
-    for p in model.color_to_label.parameters():
-        p.requires_grad = True
-    for p in model.ln_bert.parameters():
-        p.requires_grad = True
-    for p in model.ln_color.parameters():
-        p.requires_grad = True
-    for p in model.gcn1.parameters():
-        p.requires_grad = True
-    for p in model.gcn2.parameters():
-        p.requires_grad = True
-    for p in model.gnn_classifier.parameters():
-        p.requires_grad = True
-    model.residual_scale.requires_grad = True
-    model.color_logit_scale.requires_grad = True
-    model.label_color_vectors.requires_grad = True
+    _set_module_trainable(model, _COLOR_GCN_MODULES, True)
+    for name in _COLOR_GCN_PARAMS:
+        p = getattr(model, name, None)
+        if isinstance(p, nn.Parameter):
+            p.requires_grad = True
 
 
 def unfreeze_bert(model: EmotionColorGNNBERT) -> None:
@@ -1070,7 +1186,8 @@ def evaluate_model(
       - 'bert_only': BERT head logits only (no GNN)
     For BERTOnlyBaseline, gnn_branch is ignored.
     """
-    device = torch.device("cuda") # Force cuda for speed up!
+    if device is None:
+        device = next(model.parameters()).device
     ds = load_dataset("SetFit/go_emotions")
     tokenizer = AutoTokenizer.from_pretrained(bert_name)
     loader = DataLoader(

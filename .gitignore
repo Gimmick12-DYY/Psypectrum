@@ -23,3 +23,12 @@ env/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Experiment runtime artifacts
+results/
+logs/
+checkpoints/
+cache/
+*.pt
+*.ckpt
+
